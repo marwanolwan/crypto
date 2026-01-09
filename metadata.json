@@ -1,0 +1,5 @@
+{
+  "name": "CryptoMind - Alibaba Edition",
+  "description": "منصة تداول كمي احترافية مدعومة بنموذج Alibaba Cloud Qwen-Max الذكي. تستخدم محركات تحليل مؤسساتية (ADX, ATR, StochRSI) للكشف عن فرص التداول بدقة عالية.",
+  "requestFramePermissions": []
+}
