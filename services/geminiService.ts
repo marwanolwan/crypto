@@ -1,5 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { AnalysisResult } from "../types";
+import { formatNumber } from "../utils/numberUtils";
 
 // --- SYSTEM INSTRUCTIONS ---
 const SYSTEM_INSTRUCTION = `
@@ -34,18 +35,20 @@ JSON Schema:
   "riskLevel": "LOW" | "MEDIUM" | "HIGH",
   "scenario": "شرح السيناريو البديل باللغة العربية",
   "smartMoneyInsights": ["رؤية 1 بالعربية", "رؤية 2 بالعربية"],
-  "whaleActivity": { 
-      "netFlow": "وصف التدفق بالعربية (مثال: دخول سيولة قوية)", 
-      "largeTransactions": number, 
-      "sentiment": "ACCUMULATION" | "DISTRIBUTION" | "NEUTRAL", 
-      "alert": "تنبيه بالعربية (أو 'لا يوجد')" 
+  "whaleActivity": {
+      "netFlow": "ACCUMULATION" | "DISTRIBUTION" | "NEUTRAL",
+      "largeTransactions": number, // 0-100 score
+      "sentiment": "ACCUMULATION" | "DISTRIBUTION" | "NEUTRAL",
+      "alert": "String explaining whale behavior"
   },
-  "newsAnalysis": { 
-      "impact": "POSITIVE" | "NEGATIVE" | "NEUTRAL", 
-      "pricedIn": boolean, 
-      "manipulationRisk": boolean, 
-      "marketReaction": "ALIGNED" | "DIVERGENT" | "IGNORED", 
-      "summary": "ملخص الأخبار وتأثيرها بالعربية" 
+  "newsAnalysis": {
+      "impact": "POSITIVE" | "NEGATIVE" | "NEUTRAL",
+      "pricedIn": boolean,
+      "manipulationRisk": boolean,
+      "marketReaction": "ALIGNED" | "DIVERGENT" | "IGNORED",
+      "summary": "String analysis of news impact",
+      "highImpactAlert": boolean, // TRUE if Global/Existential event < 24h (Hack, Ban, War)
+      "eventCategory": "REGULATION" | "HACK" | "MACRO" | "INSTITUTIONAL" | "OTHER"
   }
 }
 `;
@@ -140,7 +143,7 @@ export const verifyApiKey = async (provider: 'alibaba' | 'google', key: string, 
 // --- TRADE OUTCOME ANALYSIS ---
 export const analyzeTradeOutcome = async (
     coin: string,
-    type: 'BULLISH' | 'BEARISH',
+    type: 'BULLISH' | 'BEARISH' | 'NEUTRAL',
     entry: number,
     stopLoss: number,
     exitPrice: number,
@@ -195,14 +198,15 @@ export const analyzeCoinWithGemini = async (coin: string, techContext: any): Pro
     if (!config.key) throw new Error("Missing API Key");
 
     // SAFETY: Helper to format values as N/A if null/undefined/NaN
-    const fmt = (val: any, decimals: number = 2) => {
+    const fmt = (val: any) => {
         if (val === null || val === undefined || isNaN(val)) return "N/A";
-        return val.toFixed(decimals);
+        // Use full precision for AI to analyze
+        return formatNumber(val, { useGrouping: false, maximumFractionDigits: 10 });
     };
 
     // Prepare Context
     const historyString = techContext.history.slice(-15).map((h: any) =>
-        `[${h.time}: ${h.price.toFixed(2)}]`
+        `[${h.time}: ${formatNumber(h.price, { useGrouping: false, maximumFractionDigits: 10 })}]`
     ).join(', ');
 
     const newsString = techContext.news?.length > 0
@@ -212,7 +216,40 @@ export const analyzeCoinWithGemini = async (coin: string, techContext: any): Pro
     const trendString = techContext.multiTf?.trendStructure?.trend || "UNKNOWN";
     const obRatio = techContext.orderBook?.imbalanceRatio?.toFixed(2) || "N/A";
     const obPressure = techContext.orderBook?.marketPressure || "NEUTRAL";
-    const currentVwap = techContext.vwap && techContext.vwap.length > 0 ? techContext.vwap[techContext.vwap.length - 1].toFixed(2) : "N/A";
+    const currentVwap = techContext.vwap && techContext.vwap.length > 0 ? formatNumber(techContext.vwap[techContext.vwap.length - 1]) : "N/A";
+
+    if (techContext.mode === 'SCALPING') {
+        const prompt = `
+    ROLE: Scalping Bot.
+    SIGNAL: ${techContext.technicalScore > 60 ? 'BULLISH' : techContext.technicalScore < 40 ? 'BEARISH' : 'NEUTRAL'}.
+    DATA: RSI=${fmt(techContext.rsi)}, MACD=${fmt(techContext.macd?.histogram)}, Vol=${fmt(techContext.volume)}.
+    TASK: ONE sentence reasoning.
+    OUTPUT JSON: { "prediction": "BULLISH"|"BEARISH"|"NEUTRAL", "confidenceScore": ${techContext.technicalScore}, "targetPrice": ${techContext.currentPrice * 1.01}, "stopLoss": ${techContext.currentPrice * 0.995}, "reasoning": "سبب واحد بالعربية" }
+        `;
+
+        try {
+            const ai = new GoogleGenAI({ apiKey: config.key });
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.0-flash-exp', // Force fastest model
+                contents: prompt,
+                // @ts-ignore
+                generationConfig: { maxOutputTokens: 100, responseMimeType: "application/json" } // Force speed
+            });
+            const jsonText = response.text || "{}";
+            const parsed = JSON.parse(jsonText);
+            return {
+                coin,
+                price: techContext.currentPrice,
+                ...parsed,
+                keyFactors: [],
+                smartMoneyInsights: [],
+                whaleActivity: { netFlow: "N/A", largeTransactions: 0, sentiment: "NEUTRAL", alert: "N/A" },
+                newsAnalysis: { impact: "NEUTRAL", pricedIn: false, manipulationRisk: false, marketReaction: "IGNORED", summary: "Skipped for Speed" }
+            };
+        } catch (e) {
+            console.warn("Lite Mode Failed, falling back to full", e);
+        }
+    }
 
     const prompt = `
     ROLE: You are a Financial Narrator explaining a Mathematical Algo-Trading Signal.
@@ -223,7 +260,7 @@ export const analyzeCoinWithGemini = async (coin: string, techContext: any): Pro
     
     DATA (Verified):
     - RSI: ${fmt(techContext.rsi)}
-    - StochRSI (K/D): ${techContext.stochRsi ? `${fmt(techContext.stochRsi.k, 0)}/${fmt(techContext.stochRsi.d, 0)}` : "N/A"}
+    - StochRSI (K/D): ${techContext.stochRsi ? `${fmt(techContext.stochRsi.k)}/${fmt(techContext.stochRsi.d)}` : "N/A"}
     - ADX: ${fmt(techContext.adx)} (Trend Strength)
     - Structure: ${techContext.structure?.trend || "RANGING"}
     
@@ -300,6 +337,72 @@ export const analyzeCoinWithGemini = async (coin: string, techContext: any): Pro
             whaleActivity: parsed.whaleActivity || { netFlow: "N/A", largeTransactions: 0, sentiment: "NEUTRAL", alert: "None" },
             newsAnalysis: parsed.newsAnalysis || { impact: "NEUTRAL", pricedIn: false, manipulationRisk: false, marketReaction: "IGNORED", summary: "N/A" }
         };
+
+
+
+        // --- CORE ALIGNMENT: FORCE MATH SIGNAL ---
+        // The AI should NOT be allowed to flip the direction determined by the Algorithms.
+        // If Score > 60, it MUST be BULLISH. If Score < 40, it MUST be BEARISH.
+        const mathSignal = techContext.technicalScore > 60 ? 'BULLISH' : techContext.technicalScore < 40 ? 'BEARISH' : 'NEUTRAL';
+        result.prediction = mathSignal;
+
+        // --- SANITIZATION & LOGIC GUARDRAILS ---
+        // Ensure strictly logical targets based on prediction type
+        if (result.prediction === 'NEUTRAL') {
+            // For NEUTRAL, Target = Resistance, Stop = Support
+            const nextRes = techContext.structure?.resistances?.find((r: number) => r > techContext.currentPrice);
+            result.targetPrice = nextRes || techContext.currentPrice * 1.02; // Default 2% Range High
+
+            const validSupports = techContext.structure?.supports?.filter((s: number) => s < techContext.currentPrice) || [];
+            const bestSupport = validSupports.length > 0 ? Math.max(...validSupports) : null;
+            result.stopLoss = bestSupport || techContext.currentPrice * 0.98; // Default 2% Range Low
+        } else if (result.prediction === 'BULLISH') {
+            // FIX: If TP is below Entry (Illogical), use nearest RESISTANCE or default 5%
+            if (result.targetPrice <= techContext.currentPrice) {
+                const nextRes = techContext.structure?.resistances?.find((r: number) => r > techContext.currentPrice);
+                result.targetPrice = nextRes || techContext.currentPrice * 1.05;
+            }
+            // FIX: If SL is above Entry (Illogical), use nearest SUPPORT or default 5%
+            if (result.stopLoss >= techContext.currentPrice) {
+                const nextSup = techContext.structure?.supports?.filter((s: number) => s < techContext.currentPrice).pop(); // Last one is closest? Sort check needed.
+                // Supports usually sorted asc? Logic says verify sort.
+                // Safer: Just take max support < price
+                const validSupports = techContext.structure?.supports?.filter((s: number) => s < techContext.currentPrice) || [];
+                const bestSupport = validSupports.length > 0 ? Math.max(...validSupports) : null;
+                result.stopLoss = bestSupport || techContext.currentPrice * 0.95;
+            }
+        } else if (result.prediction === 'BEARISH') {
+            // FIX: If TP is above Entry (Illogical), use nearest SUPPORT or default 5%
+            if (result.targetPrice >= techContext.currentPrice) {
+                const validSupports = techContext.structure?.supports?.filter((s: number) => s < techContext.currentPrice) || [];
+                const bestSupport = validSupports.length > 0 ? Math.max(...validSupports) : null;
+                result.targetPrice = bestSupport || techContext.currentPrice * 0.95;
+            }
+            // FIX: If SL is below Entry (Illogical), use nearest RESISTANCE or default 5%
+            if (result.stopLoss <= techContext.currentPrice) {
+                const nextRes = techContext.structure?.resistances?.find((r: number) => r > techContext.currentPrice);
+                result.stopLoss = nextRes || techContext.currentPrice * 1.05;
+            }
+        }
+
+        // --- SECONDARY GUARD: PERCENTAGE CLAMP (Anti-Crash/Hallucination) ---
+        // Prevent AI from setting targets > 20% away (Unrealistic for day trading) unless it's Investing
+        // Exception: If mode is INVESTING, we allow wider ranges.
+        const MAX_DEV = (techContext.mode === 'INVESTING' || techContext.mode === 'SWING') ? 0.50 : 0.15; // 50% for Swing/Inv, 15% for Day/Scalp
+
+        const distTp = Math.abs((result.targetPrice - techContext.currentPrice) / techContext.currentPrice);
+        const distSl = Math.abs((result.stopLoss - techContext.currentPrice) / techContext.currentPrice);
+
+        if (distTp > MAX_DEV) {
+            // Clamp to MAX_DEV
+            if (result.prediction === 'BULLISH') result.targetPrice = techContext.currentPrice * (1 + MAX_DEV);
+            if (result.prediction === 'BEARISH') result.targetPrice = techContext.currentPrice * (1 - MAX_DEV);
+        }
+        if (distSl > MAX_DEV) {
+            // Clamp to MAX_DEV
+            if (result.prediction === 'BULLISH') result.stopLoss = techContext.currentPrice * (1 - MAX_DEV);
+            if (result.prediction === 'BEARISH') result.stopLoss = techContext.currentPrice * (1 + MAX_DEV);
+        }
 
         return { coin, price: techContext.currentPrice, ...result };
 

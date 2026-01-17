@@ -44,6 +44,8 @@ export interface NewsAnalysis {
   marketReaction: 'ALIGNED' | 'DIVERGENT' | 'IGNORED';
   summary: string;
   flaggedTitles?: string[];
+  highImpactAlert?: boolean; // New: blocks trading if true
+  eventCategory?: 'REGULATION' | 'HACK' | 'MACRO' | 'INSTITUTIONAL' | 'OTHER';
 }
 
 export interface AnalysisResult {
@@ -66,12 +68,27 @@ export interface AnalysisResult {
 export interface ScannerSignal {
   id: string;
   coin: string;
-  signalType: 'ACCUMULATION' | 'BREAKOUT' | 'VOLUME_SPIKE' | 'DUMP' | 'SCALPING_PUMP' | 'TREND_CONTINUATION' | 'UNDERVALUED';
+  signalType: 'ACCUMULATION' | 'BREAKOUT' | 'VOLUME_SPIKE' | 'DUMP' | 'SCALPING_PUMP' | 'TREND_CONTINUATION' | 'UNDERVALUED' | 'FALSE_BREAKOUT_RISK';
   probability: number;
   daysAccumulating?: number;
   detectedAt: string;
   price: number;
   modeTag?: string;
+
+  // Hybrid System Extensions
+  marketRegime?: 'TRENDING' | 'RANGING' | 'VOLATILE' | 'ACCUMULATION' | 'DISTRIBUTION';
+  moveClassification?: 'REAL_MOMENTUM' | 'LIQUIDITY_GRAB' | 'STOP_HUNT' | 'NEWS_EVENT' | 'UNKNOWN';
+  opportunityScore?: number; // 0-100
+  riskLevel?: 'LOW' | 'MEDIUM' | 'HIGH';
+  executionBias?: 'BREAKOUT' | 'PULLBACK' | 'MEAN_REVERSION' | 'ACCUMULATION';
+  failureProbability?: string;
+  futuresData?: FuturesData; // Institutional Data
+}
+
+export interface FuturesData {
+  openInterest: number; // In USD or Contract amount
+  longShortRatio: number;
+  fundingRate: number;
 }
 
 export interface ChartPoint {
@@ -96,12 +113,14 @@ export interface SavedPrediction {
   entryPrice: number;
   targetPrice: number;
   stopLoss: number;
-  predictionType: 'BULLISH' | 'BEARISH';
+  predictionType: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   date: number;
   status: 'PENDING' | 'WIN' | 'LOSS';
   finalPrice?: number;
   confidence: number;
   failureReason?: string; // Reason for failure provided by AI
+  expiryDate?: number; // Timestamp when the trade is expected to close
+  timeframeLabel?: string; // Text label (e.g. '24h', '7d')
 }
 
 export interface MiniTicker {

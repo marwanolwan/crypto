@@ -1,6 +1,5 @@
-
 import { ChartPoint } from '../types';
-import { calculateRSI, calculateADX, calculateStochRSI, detectRSIDivergence, analyzeMarketStructure } from './cryptoApi';
+import { calculateRSI, calculateADX, calculateStochRSI, detectRSIDivergence, analyzeMarketStructure, calculateTechnicalScore, ScoreWeights } from './cryptoApi';
 
 export interface BacktestResult {
     totalTrades: number;
@@ -24,10 +23,23 @@ export interface TradeLog {
     reason: string;
 }
 
+export interface SensitivityReport {
+    baseWinRate: number;
+    variations: {
+        factor: string; // e.g., 'Momentum'
+        change: string; // '+10%' or '-10%'
+        winRate: number;
+        profitFactor: number;
+        impact: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL';
+    }[];
+    mostSensitiveFactor: string;
+}
+
 export const runBacktest = (
-    strategy: 'TREND_FOLLOWING' | 'MEAN_REVERSION',
+    strategy: 'TREND_FOLLOWING' | 'MEAN_REVERSION' | 'SCORE_BASED',
     history: ChartPoint[],
-    initialCapital: number = 1000
+    initialCapital: number = 1000,
+    weights?: ScoreWeights // Optional weights for SCORE_BASED strategy
 ): BacktestResult => {
 
     // Need at least 50 candles to calculate indicators
@@ -81,7 +93,7 @@ export const runBacktest = (
                 if (L <= position.sl) {
                     pnl = (position.sl - position.entry) / position.entry * 100; // Loss
                     closed = true;
-                    reason = 'Stop Loss (Wick)';
+                    reason = 'Stop Loss';
                 } else if (H >= position.tp) {
                     pnl = (position.tp - position.entry) / position.entry * 100; // Win
                     closed = true;
@@ -91,7 +103,7 @@ export const runBacktest = (
                 if (H >= position.sl) {
                     pnl = (position.entry - position.sl) / position.entry * 100; // Loss
                     closed = true;
-                    reason = 'Stop Loss (Wick)';
+                    reason = 'Stop Loss';
                 } else if (L <= position.tp) {
                     pnl = (position.entry - position.tp) / position.entry * 100; // Win
                     closed = true;
@@ -138,11 +150,32 @@ export const runBacktest = (
         // Logic for Entry
         if (!position) {
             const lookbackPrices = prices.slice(0, i + 1);
-            const rsi = calculateRSI(lookbackPrices);
-            const structure = analyzeMarketStructure(lookbackPrices);
 
-            // Strategy 1: Trend Following (Buy dips in Uptrend)
-            if (strategy === 'TREND_FOLLOWING') {
+            // Strategy 3: SCORE BASED (New)
+            if (strategy === 'SCORE_BASED') {
+                const rsi = calculateRSI(lookbackPrices);
+                const structure = analyzeMarketStructure(lookbackPrices);
+                const adx = calculateADX([], [], lookbackPrices); // High/Low ignored in simple calc
+                const stoch = calculateStochRSI(lookbackPrices);
+                const divergence = detectRSIDivergence(lookbackPrices, []); // Simplified
+
+                // Calculate Score with custom weights if provided
+                const score = calculateTechnicalScore(
+                    lookbackPrices, rsi, adx, stoch, structure.trend, divergence, undefined, weights
+                );
+
+                // Buy Threshold
+                if (score > 75) {
+                    // Buy
+                    const sl = currentPrice * 0.98; // 2% fixed for simplicity in sensitivty check
+                    const tp = currentPrice * 1.04;
+                    position = { type: 'LONG', entry: currentPrice, time: candle.time, sl, tp };
+                }
+            }
+            // Re-adding Legacy Trend/Mean for compatibility:
+            else if (strategy === 'TREND_FOLLOWING') {
+                const rsi = calculateRSI(lookbackPrices);
+                const structure = analyzeMarketStructure(lookbackPrices);
                 if (structure.trend === 'UPTREND' && rsi && rsi < 40) {
                     // Buy Signal
                     // Static Risk: 2% SL, 4% TP
@@ -153,7 +186,9 @@ export const runBacktest = (
             }
 
             // Strategy 2: Mean Reversion (Buy Oversold, Sell Overbought in Range)
-            if (strategy === 'MEAN_REVERSION') {
+            else if (strategy === 'MEAN_REVERSION') {
+                const rsi = calculateRSI(lookbackPrices);
+                const structure = analyzeMarketStructure(lookbackPrices);
                 if (structure.trend === 'RANGING') {
                     if (rsi && rsi < 30) {
                         const sl = currentPrice * 0.97;
@@ -183,6 +218,67 @@ export const runBacktest = (
         maxDrawdown,
         equityCurve,
         trades
+    };
+};
+
+export const runSensitivityAnalysis = (history: ChartPoint[]): SensitivityReport => {
+    // 1. Run Base Score Backtest
+    const baseResult = runBacktest('SCORE_BASED', history);
+
+    // 2. Define Variations
+    const factors: (keyof ScoreWeights)[] = ['momentum', 'trend', 'rsiOverbought', 'rsiOversold', 'adx', 'stoch', 'div'];
+    const variations: SensitivityReport['variations'] = [];
+
+    const baseWeights: ScoreWeights = {
+        momentum: 10, trend: 10, rsiOverbought: 20, rsiOversold: 10,
+        adx: 5, stoch: 10, div: 15, orderBook: 10
+    };
+
+    factors.forEach(factor => {
+        // Test +20% Weight (More Sensitive)
+        const weightsHigh = { ...baseWeights, [factor]: baseWeights[factor] * 1.2 };
+        const resHigh = runBacktest('SCORE_BASED', history, 1000, weightsHigh);
+
+        variations.push({
+            factor, change: '+20%',
+            winRate: resHigh.winRate,
+            profitFactor: resHigh.profitFactor,
+            impact: resHigh.winRate > baseResult.winRate ? 'POSITIVE' : resHigh.winRate < baseResult.winRate ? 'NEGATIVE' : 'NEUTRAL'
+        });
+
+        // Test -20% Weight (Less Sensitive)
+        const weightsLow = { ...baseWeights, [factor]: baseWeights[factor] * 0.8 };
+        const resLow = runBacktest('SCORE_BASED', history, 1000, weightsLow);
+
+        variations.push({
+            factor, change: '-20%',
+            winRate: resLow.winRate,
+            profitFactor: resLow.profitFactor,
+            impact: resLow.winRate > baseResult.winRate ? 'POSITIVE' : resLow.winRate < baseResult.winRate ? 'NEGATIVE' : 'NEUTRAL'
+        });
+    });
+
+    // Determine Most Sensitive Factor (Max variance in Win Rate)
+    // Simple heuristic: Find factor with largest gap between High and Low result
+    let maxDiff = 0;
+    let mostSensitive = 'None';
+
+    factors.forEach(factor => {
+        const vHigh = variations.find(v => v.factor === factor && v.change === '+20%');
+        const vLow = variations.find(v => v.factor === factor && v.change === '-20%');
+        if (vHigh && vLow) {
+            const diff = Math.abs(vHigh.winRate - vLow.winRate);
+            if (diff > maxDiff) {
+                maxDiff = diff;
+                mostSensitive = factor;
+            }
+        }
+    });
+
+    return {
+        baseWinRate: baseResult.winRate,
+        variations,
+        mostSensitiveFactor: mostSensitive
     };
 };
 

@@ -1,10 +1,12 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { ScannerSignal, CoinData } from '../types';
 import { getMarketData, subscribeToMiniTicker } from '../services/cryptoApi';
+import { HybridScannerService } from '../services/HybridScannerService';
 import { ArrowUpRight, Radar, Zap, Activity, Clock, Briefcase, Flame, Wifi } from 'lucide-react';
+import { formatCurrency, formatNumber } from '../utils/numberUtils';
 
 interface ScannerProps {
-    onSelectCoin: (id: string, symbol: string) => void;
+    onSelectCoin: (id: string, symbol: string, mode?: string) => void;
 }
 
 type ScanMode = 'SCALPING' | 'DAY' | 'SWING' | 'INVESTING';
@@ -27,6 +29,7 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
     const [loading, setLoading] = useState(true);
     const [mode, setMode] = useState<ScanMode>('SCALPING');
     const [isLive, setIsLive] = useState(false);
+    const [experimentalMode, setExperimentalMode] = useState(false); // New Toggle
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const [_lastUpdate, setLastUpdate] = useState<number>(Date.now());
 
@@ -42,7 +45,17 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
             setLoading(true);
             try {
                 // 1. Seed Buffer with Snapshot (Tickers)
-                const snapshot = await getMarketData(250, true);
+                // Pass category based on Experimental Mode
+                const category = experimentalMode ? 'LOW_CAP' : 'TOP';
+                const limit = experimentalMode ? 250 : 250; // Slice is handled in API, limit is redundant there but good for safety
+
+                const snapshot = await getMarketData(limit, true, category);
+
+                // Clear Buffer when switching modes to avoid mixing Top/LowCap
+                if (priceBuffer.current.size > 0 && initialLoadDone.current) {
+                    priceBuffer.current.clear();
+                }
+
                 const now = Date.now();
                 snapshot.forEach(coin => {
                     const symbol = coin.symbol;
@@ -86,7 +99,7 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
         return () => {
             if (cleanupWs) cleanupWs();
         };
-    }, [mode]);
+    }, [mode, experimentalMode]); // Add experimentalMode dependency
 
     // Interval to refresh UI signals from Buffer (Throttle UI updates to 1s)
     useEffect(() => {
@@ -115,6 +128,10 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
             const price = parseFloat(t.c);
             const volume = parseFloat(t.v); // Total Volume 24h (Binance sends Cumulative Volume in MiniTicker)
 
+            // OPTIMIZATION: Only process symbols that are in our Initial Snapshot (Top 250 OR Low Cap)
+            // This prevents the buffer from filling with 2000+ coins if we are only interested in the selected list
+            if (!priceBuffer.current.has(symbol)) return;
+
             // We need to store standard Symbol Key
             let history = priceBuffer.current.get(symbol);
             if (!history) {
@@ -132,26 +149,26 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
                 // Or just filter. Array is small (900 items max if 1s updates), slice is fine.
                 // Keeping it simple: remove if older than cutoff.
                 // Since it's sorted by time, we can just shift.
+                let loops = 0;
                 while (history.length > 0 && history[0].t < cutoff) {
                     history.shift();
+                    loops++;
+                    if (loops > 1000) break; // Emergency break
                 }
             }
         });
     };
 
-    const analyzeBufferForSignals = () => {
-        const detectedSignals: ScannerSignal[] = [];
+    const analyzeBufferForSignals = async () => {
+        const candidates: ScannerSignal[] = [];
         const now = Date.now();
 
         priceBuffer.current.forEach((history, symbol) => {
-            if (history.length < 5) return; // Need at least some seconds of data
+            if (history.length < 5) return;
 
             const current = history[history.length - 1];
-            // Get data from 1 minute ago (approx)
-            // find point closest to now - 60000ms
             const oneMinAgoTarget = now - 60000;
-
-            let p1m = history[0]; // fallback if history is short
+            let p1m = history[0];
 
             // Find closest historical point
             for (let i = history.length - 1; i >= 0; i--) {
@@ -161,52 +178,60 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
                 }
             }
 
-            // Prevent division by zero or bad data
             if (p1m.p === 0) return;
-
-            // --- ALGORITHMS ---
 
             const price = current.p;
             const price1m = p1m.p;
-
             const mom1m = ((price - price1m) / price1m) * 100;
 
-            // 1. SCALPING IGNITION (Serious Pump Start in 1m)
-            // Rules:
-            // - 1m Move > 0.4% (Very fast for 1min)
-            // - We focus on PURE MOMENTUM
-
+            // 1. SCALPING IGNITION
             if (mom1m > 0.4) {
-                detectedSignals.push({
+                candidates.push({
                     id: symbol + 'USDT',
                     coin: symbol,
                     signalType: 'SCALPING_PUMP',
                     probability: Math.min(80 + (mom1m * 10), 99),
                     detectedAt: 'الآن',
                     price: price,
-                    modeTag: `🚀${mom1m.toFixed(2)}% (1m)`
+                    modeTag: `🚀${formatNumber(mom1m)}% (1m)`
                 });
             }
-
             // 2. FLASH DUMP
             else if (mom1m < -0.5) {
-                detectedSignals.push({
+                candidates.push({
                     id: symbol + 'USDT',
                     coin: symbol,
                     signalType: 'DUMP',
                     probability: 80,
                     detectedAt: 'الآن',
                     price: price,
-                    modeTag: `🔻${mom1m.toFixed(2)}% (1m)`
+                    modeTag: `🔻${formatNumber(mom1m)}% (1m)`
                 });
             }
         });
 
-        // Sort by Magnitude
-        detectedSignals.sort((a, b) => b.probability - a.probability);
+        // Enrich with Futures Data (Async)
+        const detectedSignals = await Promise.all(candidates.map(async (base) => {
+            // Lazy load to avoid top-level import cycles if any
+            const { getBinanceFuturesData } = await import('../services/cryptoApi');
+            const futuresData = await getBinanceFuturesData(base.coin);
+
+            const history = priceBuffer.current.get(base.coin)?.map(h => ({
+                time: new Date(h.t).toISOString(),
+                price: h.p,
+                volume: h.v
+            })) || [];
+
+            const enriched = HybridScannerService.enrichSignal(base, history);
+            return { ...base, ...enriched, futuresData: futuresData || undefined };
+        }));
+
+        detectedSignals.sort((a, b) => (b.opportunityScore || b.probability) - (a.opportunityScore || a.probability));
         // Take top 20
         setSignals(detectedSignals.slice(0, 20));
     };
+
+    // --- STATIC FALLBACK LOGIC (Day/Swing/Invest with Deep Dive) ---
 
     // --- STATIC FALLBACK LOGIC (Day/Swing/Invest with Deep Dive) ---
 
@@ -222,34 +247,63 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
                 // Fetch History based on Mode
                 // SWING -> Daily Candles
                 // INVEST -> Weekly Candles
-                const timeframe = mode === 'INVESTING' ? 'D' : 'D';
-                // Note: cryptoApi's fetchCandlesForAnalysis uses 'D' for Daily. 
-                // Ideally Investing uses Weekly but Daily is enough for simple ATH check over 365 days.
+                // DAY -> 1H Candles (for RSI Check)
+                let timeframe = 'D';
+                if (mode === 'DAY') timeframe = '60';
 
-                const { fetchCandlesForAnalysis } = await import('../services/cryptoApi');
+                const { fetchCandlesForAnalysis, getBinanceFuturesData } = await import('../services/cryptoApi');
                 const history = await fetchCandlesForAnalysis(coin.symbol, timeframe, 200);
+                const futuresData = await getBinanceFuturesData(coin.symbol);
 
                 if (history.length < 50) return;
 
                 const lastPrice = history[history.length - 1].price;
+                const rsi = history[history.length - 1].rsi || 50;
 
-                if (mode === 'SWING') {
+                let baseSignal: ScannerSignal | null = null;
+
+                if (mode === 'DAY') {
+                    // DAY RULES (Advanced RSI Filter):
+                    // 1. Breakout Validation: Price > VWAP (Checked in Snapshot)
+                    // 2. RSI Check:
+                    //    - RSI < 70: Strong Breakout (Green)
+                    //    - RSI > 80: Exhausted/Fakeout Risk (Red Flag)
+
+                    if (rsi > 80) {
+                        // EXTREME RISK - FAKEOUT LIKELY
+                        // Penalize probability heavily
+                        baseSignal = {
+                            id: coin.id, coin: coin.symbol, signalType: 'FALSE_BREAKOUT_RISK',
+                            probability: 40, // Low confidence
+                            detectedAt: '24س',
+                            price: coin.price,
+                            modeTag: `⚠️ RSI ${rsi.toFixed(0)} (Overbought)`
+                        };
+                    } else {
+                        // HEALTHY BREAKOUT
+                        baseSignal = {
+                            id: coin.id, coin: coin.symbol, signalType: 'BREAKOUT',
+                            probability: 85 + (rsi < 60 ? 10 : 0), // Boost if fresh momentum
+                            detectedAt: '24س',
+                            price: coin.price,
+                            modeTag: `Day +${formatNumber(coin.change24h)}%`
+                        };
+                    }
+                }
+                else if (mode === 'SWING') {
                     // SWING RULES:
                     // 1. Uptrend: Price > EMA 50 (Approximated by simple SMA of last 50)
                     const sma50 = history.slice(-50).reduce((a, b) => a + b.price, 0) / 50;
 
-                    // 2. RSI Checks (Pre-calculated in cryptoApi)
-                    const rsi = history[history.length - 1].rsi || 50;
-
                     // Condition: Uptrend AND Not Overbought
                     if (lastPrice > sma50 && rsi < 70) {
-                        enhancedSignals.push({
+                        baseSignal = {
                             id: coin.id, coin: coin.symbol, signalType: 'TREND_CONTINUATION',
                             probability: 85 + (rsi < 50 ? 10 : 0), // Bonus if not overbought
                             detectedAt: 'يومي',
                             price: coin.price,
                             modeTag: `Trend: Above EMA50`
-                        });
+                        };
                     }
                 }
                 else if (mode === 'INVESTING') {
@@ -258,18 +312,21 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
                     const maxHigh = Math.max(...history.map(h => h.price));
                     const drawdown = ((maxHigh - lastPrice) / maxHigh) * 100;
 
-                    // 2. RSI Weekly (Approximated by Daily RSI being low for long time? Or just Daily RSI < 40)
-                    const rsi = history[history.length - 1].rsi || 50;
-
                     if (drawdown > 40 && rsi < 45) { // 40% Discount + Oversold
-                        enhancedSignals.push({
+                        baseSignal = {
                             id: coin.id, coin: coin.symbol, signalType: 'UNDERVALUED',
                             probability: 80 + (drawdown / 2),
                             detectedAt: 'استثماري',
                             price: coin.price,
-                            modeTag: `Discount: -${drawdown.toFixed(0)}%`
-                        });
+                            modeTag: `Discount: -${formatNumber(drawdown)}%`
+                        };
                     }
+                }
+
+                if (baseSignal) {
+                    // HYBRID ENRICHMENT
+                    const enriched = HybridScannerService.enrichSignal(baseSignal, history);
+                    enhancedSignals.push({ ...baseSignal, ...enriched, futuresData: futuresData || undefined });
                 }
 
             } catch (e) {
@@ -279,7 +336,7 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
 
         // Merge/Set Signals
         if (enhancedSignals.length > 0) {
-            enhancedSignals.sort((a, b) => b.probability - a.probability);
+            enhancedSignals.sort((a, b) => (b.opportunityScore || 0) - (a.opportunityScore || 0));
             setSignals(prev => [...enhancedSignals, ...prev].slice(0, 20)); // Prepend deep signals
         }
     };
@@ -291,12 +348,9 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
         data.forEach(coin => {
             if (mode === 'DAY') {
                 // DAY RULE: Aggressive Move + Price > VWAP (Buyers in Control)
-                // VWAP check ensures we don't buy the top of a pump that is crashing back down
                 if (coin.change24h > 4 && coin.price > coin.weightedAvgPrice) {
-                    detected.push({
-                        id: coin.id, coin: coin.symbol, signalType: 'BREAKOUT',
-                        probability: 85, detectedAt: '24س', price: coin.price, modeTag: `Day +${coin.change24h.toFixed(1)}%`
-                    });
+                    // PUSH TO DEEP DIVE INSTEAD OF DIRECT ADD
+                    candidatesForDeepDive.push(coin);
                 }
             }
             else if (mode === 'SWING') {
@@ -313,16 +367,13 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
             }
         });
 
-        // Set initial "surface" signals for Day trading
-        if (mode === 'DAY') {
-            detected.sort((a, b) => b.probability - a.probability);
-            setSignals(detected.slice(0, 20));
-        }
+        // Set initial "surface" signals for Day trading -> NOW REMOVED, relying on Deep Dive 
+        // if (mode === 'DAY') ...
 
-        // Trigger Phase 2 for Swing/Invest
+        // Trigger Phase 2 for Swing/Invest/Day
         if (candidatesForDeepDive.length > 0) {
             analyzeDeepDive(candidatesForDeepDive);
-        } else if (mode !== 'DAY') {
+        } else if (mode !== 'SCALPING') {
             setSignals([]); // Clear if no candidates
         }
     };
@@ -337,6 +388,7 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
             case 'SCALPING_PUMP': return 'زخم شرائي (Ignition)';
             case 'TREND_CONTINUATION': return 'استمرار اتجاه';
             case 'UNDERVALUED': return 'فرصة استثمارية';
+            case 'FALSE_BREAKOUT_RISK': return '⚠️ خطر اختراق وهمي';
             default: return type;
         }
     }
@@ -365,10 +417,24 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
                             <p className="text-slate-400 text-sm">تحديثات لحظية ومسح لكل أزواج USDT</p>
                         </div>
                     </div>
-                    <button onClick={() => setMode(mode)} className="p-2 hover:bg-slate-800 rounded-lg text-slate-400" title="Reset">
-                        {/* Fake refresh, effectively resets state via useEffect dependency if we toggled logic, else just visual */}
-                        <Activity size={20} className={loading ? 'animate-spin' : ''} />
-                    </button>
+                    <div className="flex items-center gap-2">
+                        {/* Experimental Toggle */}
+                        <button
+                            onClick={() => setExperimentalMode(!experimentalMode)}
+                            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${experimentalMode
+                                ? 'bg-purple-600 text-white shadow-[0_0_15px_rgba(147,51,234,0.5)]'
+                                : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+                                }`}
+                        >
+                            <Flame size={14} className={experimentalMode ? "animate-pulse" : ""} />
+                            {experimentalMode ? "تجريبي: عملات صغيرة" : "العملات الرئيسية"}
+                        </button>
+
+                        <button onClick={() => setMode(mode)} className="p-2 hover:bg-slate-800 rounded-lg text-slate-400" title="Reset">
+                            {/* Fake refresh, effectively resets state via useEffect dependency if we toggled logic, else just visual */}
+                            <Activity size={20} className={loading ? 'animate-spin' : ''} />
+                        </button>
+                    </div>
                 </div>
 
                 {/* Mode Tabs */}
@@ -400,10 +466,18 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
             ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     {signals.map((signal) => (
-                        <div key={signal.id} onClick={() => onSelectCoin(signal.id, signal.coin)} className="bg-slate-900 border border-slate-800 rounded-xl p-5 hover:border-indigo-500/50 transition-all cursor-pointer group relative overflow-hidden">
+                        <div key={signal.id} onClick={() => onSelectCoin(signal.id, signal.coin, mode)} className="bg-slate-900 border border-slate-800 rounded-xl p-5 hover:border-indigo-500/50 transition-all cursor-pointer group relative overflow-hidden">
                             <div className="absolute top-0 left-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
                                 {signal.signalType === 'DUMP' ? <Activity className="w-16 h-16 text-red-500" /> : <Flame className="w-16 h-16 text-emerald-500" />}
                             </div>
+
+                            {/* Whale Alert Banner */}
+                            {(signal as any).institutionalTag && (
+                                <div className="mx-5 -mt-2 mb-3 bg-indigo-500/10 border border-indigo-500/30 rounded-lg p-2 flex items-center gap-2 animate-pulse">
+                                    <span className="text-xl">🐋</span>
+                                    <span className="text-xs font-bold text-indigo-300">{(signal as any).institutionalTag}</span>
+                                </div>
+                            )}
 
                             <div className="flex justify-between items-start mb-4">
                                 <div className="flex items-center gap-3">
@@ -412,12 +486,12 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
                                     </div>
                                     <div>
                                         <h3 className="text-lg font-bold text-white">{signal.coin}</h3>
-                                        <span className="text-xs text-slate-500 font-mono">${signal.price}</span>
+                                        <span className="text-xs text-slate-500 font-mono">{formatCurrency(signal.price)}</span>
                                     </div>
                                 </div>
-                                <div className={`px-2 py-1 rounded text-xs font-bold ${signal.probability > 90 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'
+                                <div className={`px-2 py-1 rounded text-xs font-bold ${(signal.opportunityScore || signal.probability) > 80 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'
                                     }`}>
-                                    {Math.floor(signal.probability)}% جودة
+                                    {Math.round(signal.opportunityScore || signal.probability)} Score
                                 </div>
                             </div>
 
@@ -426,27 +500,94 @@ export const Scanner: React.FC<ScannerProps> = ({ onSelectCoin }) => {
                                     <span className="text-slate-400">الإشارة</span>
                                     <span className={`font-medium ${signal.signalType === 'DUMP' ? 'text-red-400' :
                                         signal.signalType === 'SCALPING_PUMP' ? 'text-green-400' :
-                                            'text-white'
+                                            signal.signalType === 'FALSE_BREAKOUT_RISK' ? 'text-orange-400' :
+                                                'text-white'
                                         }`}>{getArabicSignalType(signal.signalType)}</span>
                                 </div>
                                 {signal.modeTag && (
                                     <div className="flex justify-between text-sm">
-                                        <span className="text-slate-400">التغير (1د)</span>
-                                        <span className={`font-mono font-bold ${signal.modeTag.includes('🔻') ? 'text-red-400' : 'text-emerald-400'
+                                        <span className="text-slate-400">التفسير</span>
+                                        <span className={`font-mono font-serif text-xs ${signal.modeTag.includes('🔻') ? 'text-red-400' : 'text-emerald-400'
                                             }`}>
                                             {signal.modeTag}
                                         </span>
                                     </div>
+                                )}
+
+                                {signal.riskLevel && (
+                                    <div className="grid grid-cols-2 gap-2 mt-2">
+                                        <div className={`text-[10px] text-center px-1 py-1 rounded border ${signal.riskLevel === 'HIGH' ? 'bg-red-900/20 border-red-800 text-red-400' :
+                                            signal.riskLevel === 'LOW' ? 'bg-green-900/20 border-green-800 text-green-400' :
+                                                'bg-slate-800 border-slate-700 text-slate-400'
+                                            }`}>
+                                            Risk: {signal.riskLevel}
+                                        </div>
+                                        <div className="text-[10px] text-center px-1 py-1 rounded border bg-slate-800 border-slate-700 text-slate-300">
+                                            {signal.marketRegime || 'UNKNOWN'}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {signal.futuresData && (
+                                    <div className="grid grid-cols-3 gap-1 mt-2 p-2 bg-slate-950/30 rounded border border-slate-800/50">
+                                        <div className="flex flex-col items-center">
+                                            <span className="text-[8px] text-slate-500 uppercase">Open Int.</span>
+                                            <span className="text-[10px] text-indigo-300 font-mono">{formatNumber(signal.futuresData.openInterest)}</span>
+                                        </div>
+                                        <div className="flex flex-col items-center border-l border-slate-800">
+                                            <span className="text-[8px] text-slate-500 uppercase">L/S Ratio</span>
+                                            <span className={`text-[10px] font-mono ${signal.futuresData.longShortRatio > 2 ? 'text-red-400' : signal.futuresData.longShortRatio < 0.8 ? 'text-green-400' : 'text-slate-300'}`}>
+                                                {signal.futuresData.longShortRatio.toFixed(2)}
+                                            </span>
+                                        </div>
+                                        <div className="flex flex-col items-center border-l border-slate-800">
+                                            <span className="text-[8px] text-slate-500 uppercase">Funding</span>
+                                            <span className={`text-[10px] font-mono ${signal.futuresData.fundingRate > 0.01 ? 'text-orange-400' : 'text-slate-300'}`}>
+                                                {(signal.futuresData.fundingRate * 100).toFixed(3)}%
+                                            </span>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Opportunity Type Label */}
+                            <div className="mt-2 text-center pt-2 border-t border-slate-800/50">
+                                {(signal.signalType === 'DUMP' || signal.signalType === 'FALSE_BREAKOUT_RISK') ? (
+                                    // SELL Logic
+                                    (signal.opportunityScore || 0) > 80 ? (
+                                        <span className="text-red-500 font-bold text-sm animate-pulse block">
+                                            فرصة بيع قوية 🔥
+                                        </span>
+                                    ) : (
+                                        <span className="text-red-400 font-bold text-sm block">
+                                            فرصة بيع محتملة 🔻
+                                        </span>
+                                    )
+                                ) : (
+                                    // BUY Logic
+                                    (signal.opportunityScore || 0) > 80 ? (
+                                        <span className="text-emerald-400 font-black text-sm animate-pulse block shadow-green-500/20 drop-shadow-sm">
+                                            فرصة شراء قوية 🚀
+                                        </span>
+                                    ) : (signal.opportunityScore || 0) > 60 ? (
+                                        <span className="text-emerald-500 font-bold text-sm block">
+                                            فرصة صفقة شراء ✅
+                                        </span>
+                                    ) : (
+                                        <span className="text-yellow-500 font-bold text-sm block opacity-90">
+                                            فرصة شراء ضعيفة ⚠️
+                                        </span>
+                                    )
                                 )}
                             </div>
 
                             <div className="mt-4 pt-4 border-t border-slate-800 flex justify-between items-center">
                                 <div className="text-xs text-slate-500 flex items-center gap-1">
                                     <Zap className="w-3 h-3 text-orange-500" />
-                                    {mode === 'SCALPING' ? 'Live Momentum' : 'Analysis'}
+                                    {mode === 'SCALPING' ? 'زخم لحظي (Live Momentum)' : 'تحليل السوق'}
                                 </div>
                                 <button
-                                    onClick={(e) => { e.stopPropagation(); onSelectCoin(signal.id, signal.coin); }}
+                                    onClick={(e) => { e.stopPropagation(); onSelectCoin(signal.id, signal.coin, mode); }}
                                     className="text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1 shadow-lg shadow-indigo-500/20"
                                 >
                                     تحليل وتفسير <ArrowUpRight className="w-3 h-3" />

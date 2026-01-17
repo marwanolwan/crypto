@@ -16,6 +16,7 @@ export interface OrderBookAnalysis {
 
 // Use Binance Vision (Public Data) as it often has better CORS/Rate limits for public data than api.binance.com
 const BINANCE_BASE = 'https://data-api.binance.vision/api/v3';
+const BINANCE_FUTURES_BASE = 'https://fapi.binance.com/fapi/v1'; // Requires Proxy usually
 const NEWS_API_BASE = 'https://min-api.cryptocompare.com/data/v2';
 
 // Simple In-Memory Cache
@@ -29,33 +30,31 @@ const getBinanceHeaders = () => {
 };
 
 // Verify Binance Connection
+// Verify Binance Connection
 export const verifyBinanceConnection = async (apiKey: string, apiSecret?: string): Promise<{ valid: boolean; error?: string }> => {
+    // NOTE: We cannot safely verify API Keys from the browser due to CORS.
+    // Instead, we verify that we can reach Binance via our Proxy Network.
+    // This confirms "Connectivity" is good.
     try {
-        const headers: any = {};
-        if (apiKey) headers['X-MBX-APIKEY'] = apiKey;
+        // Use fetchSmart to hit a public endpoint via proxy.
+        // We do NOT send headers to avoid triggering strict CORS on the browser side before proxy fallback.
+        const res = await fetchSmart(`${BINANCE_BASE}/time`);
 
-        // We use a lightweight public endpoint that respects the API Key for rate limits
-        // "/api/v3/time" is better.
-        const response = await fetch(`${BINANCE_BASE}/time`, { headers });
-
-        if (response.ok) {
+        if (res) {
             return { valid: true };
         } else {
-            // If CORS fails on direct fetch with custom headers, we might get a network error handled in catch block
-            // But if we get a 401/403, it means connection works but key is bad
-            return { valid: false, error: `HTTP Error: ${response.status}` };
+            return { valid: false, error: "Could not reach Binance (Proxy Network Down)" };
         }
     } catch (e: any) {
-        // Network error likely due to CORS when sending headers from browser
-        // We accept this as "Partial Success" because public endpoints will still work via proxy
-        console.warn("Binance Ping Failed (likely CORS), but saving key for backend/proxy usage if applicable.");
-        return { valid: true };
+        return { valid: false, error: e.message };
     }
 };
 
 // Smart Fetch with Proxy Fallback and Type Checking
 const fetchSmart = async (url: string, headers: any = {}): Promise<any> => {
     // 1. Try Direct Fetch (Works if CORS is enabled on server or via Extension)
+    // NOTE: We only try direct if we don't suspect a CORS block.
+    // If headers are empty, it's a Simple Request (more likely to succeed).
     try {
         const response = await fetch(url, { headers });
         const contentType = response.headers.get("content-type");
@@ -71,18 +70,32 @@ const fetchSmart = async (url: string, headers: any = {}): Promise<any> => {
     const proxies = [
         // CodeTabs - Very reliable for JSON data
         (u: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-        // CorsProxy.io
-        (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-        // AllOrigins
-        (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`
+        // AllOrigins (Raw) - Often works
+        (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+        // AllOrigins (JSON) - Fallback if Raw fails (needs parsing)
+        (u: string) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`
     ];
 
-    for (const buildProxyUrl of proxies) {
+    // Shuffle proxies to avoid hammering one
+    const shuffled = proxies.sort(() => 0.5 - Math.random());
+
+    for (const buildProxyUrl of shuffled) {
         try {
             const proxyUrl = buildProxyUrl(url);
             const response = await fetch(proxyUrl);
             if (response.ok) {
                 const text = await response.text();
+
+                // Handle AllOrigins JSON wrapper
+                if (proxyUrl.includes('api.allorigins.win/get')) {
+                    try {
+                        const wrapper = JSON.parse(text);
+                        if (wrapper.contents) {
+                            return JSON.parse(wrapper.contents);
+                        }
+                    } catch (e) { continue; }
+                }
+
                 // STRICT CHECK: Ensure result is actually JSON, not an HTML error page from the proxy
                 if (text.trim().startsWith('<')) continue;
 
@@ -122,8 +135,8 @@ const fetchWithCache = async (url: string, headers: any = {}, skipCache: boolean
 
 // --- DATA FETCHING ROUTER (BINANCE ONLY) ---
 
-export const getMarketData = async (limit: number = 50, skipCache: boolean = false): Promise<CoinData[]> => {
-    return getBinanceMarketData(limit, skipCache);
+export const getMarketData = async (limit: number = 50, skipCache: boolean = false, category: 'TOP' | 'LOW_CAP' = 'TOP'): Promise<CoinData[]> => {
+    return getBinanceMarketData(limit, skipCache, category);
 };
 
 export const getCoinHistory = async (coinId: string, symbol: string, timeframe: string): Promise<{
@@ -141,6 +154,7 @@ export const getMultiTimeframeConfluence = async (symbol: string, primaryTf: str
     if (primaryTf === '1' || primaryTf === '5') higherTf = '60'; // 15m -> 1H
     if (primaryTf === '15' || primaryTf === '30') higherTf = '240'; // 30m -> 4H
     if (primaryTf === '60' || primaryTf === '240') higherTf = 'D'; // 4H -> 1D
+    if (primaryTf === 'D') higherTf = 'W'; // 1D -> 1W // Fixed mapping
 
     const [primary, trend] = await Promise.all([
         getBinanceHistory(symbol, primaryTf, fresh),
@@ -159,11 +173,16 @@ export const getMultiTimeframeConfluence = async (symbol: string, primaryTf: str
 export const getOrderBookAnalysis = async (symbol: string): Promise<OrderBookAnalysis> => {
     try {
         let pair = symbol.toUpperCase().trim();
-        if (pair === 'BITCOIN') pair = 'BTC';
-        if (pair === 'ETHEREUM') pair = 'ETH';
-        if (!pair.includes('USDT') && !pair.endsWith('BTC')) pair = `${pair}USDT`;
 
-        const data = await fetchSmart(`${BINANCE_BASE}/depth?symbol=${pair}&limit=20`);
+        // CORRECTION: FIX PAIR FORMATTING
+        if (!pair.includes('USDT') && !pair.includes('BTC')) {
+            pair = `${pair}USDT`;
+        } else if (pair.length <= 4 && !pair.includes('USDT')) {
+            pair = `${pair}USDT`;
+        }
+
+        // Public Data - No Headers Needed to avoid CORS Preflight
+        const data = await fetchSmart(`${BINANCE_BASE}/depth?symbol=${pair}&limit=20`, {});
 
         if (!data || !data.bids || !data.asks) throw new Error("Invalid Depth Data");
 
@@ -209,7 +228,7 @@ export const detectWhaleMovements = (
     history: ChartPoint[]
 ): WhaleMetrics => {
     // STRICT CHECK: If history is insufficient, return Neutral to avoid hallucination
-    if (!history || history.length < 24) {
+    if (!history || history.length < 50) {
         return {
             netFlowStatus: 'NEUTRAL',
             volumeAnomalyFactor: 0,
@@ -220,37 +239,35 @@ export const detectWhaleMovements = (
 
     const turnover = marketCap > 0 ? (volume24h / marketCap) * 100 : 0;
 
-    const recentVols = history.slice(-24).map(h => h.volume || 0);
+    // 1. Extended Baseline: Use 50 candles for Volume Moving Average
+    const recentVols = history.slice(-50).map(h => h.volume || 0);
     const avgVol = recentVols.reduce((a, b) => a + b, 0) / (recentVols.length || 1);
 
     // Avoid division by zero
-    const anomalyFactor = avgVol > 0 ? volume24h / (avgVol * 24) : 1;
+    const anomalyFactor = avgVol > 0 ? volume24h / (avgVol * 24) : 1; // Assuming daily vol vs minute candles needs normalization, or if history is daily
+
+    // Calculate Short-term Price Change (Last 5 candles) to detect immediate action
+    const last5 = history.slice(-5);
+    const shortTermChange = last5.length > 0 ? ((last5[last5.length - 1].price - last5[0].price) / last5[0].price) * 100 : 0;
 
     let netFlow: 'ACCUMULATION' | 'DISTRIBUTION' | 'NEUTRAL' = 'NEUTRAL';
     let alert = "لا يوجد نشاط غير طبيعي";
 
-    // Enhanced Whale Logic: Check Close Position Relative to High/Low
-    const lastCandle = history[history.length - 1];
-    const isHighClose = lastCandle ? (lastCandle.price - (lastCandle.low || lastCandle.price)) / ((lastCandle.high || lastCandle.price) - (lastCandle.low || lastCandle.price)) > 0.7 : false;
-    const isLowClose = lastCandle ? (lastCandle.price - (lastCandle.low || lastCandle.price)) / ((lastCandle.high || lastCandle.price) - (lastCandle.low || lastCandle.price)) < 0.3 : false;
-
-    if (anomalyFactor > 1.5 && Math.abs(priceChange24h) < 3) {
-        // High Volume + Flat Price = Absorption/Accumulation
+    // 2. Stricter Institutional Logic
+    if (anomalyFactor > 2.0 && Math.abs(shortTermChange) < 0.5) {
+        // High Volume + Flat Price = Absorption (Limit Orders absorbing selling pressure)
         netFlow = 'ACCUMULATION';
-        alert = "جدار شراء مخفي: حجم تداول ضخم مع ثبات سعري (امتصاص)";
+        alert = "تجميع مؤسساتي (Accumulation): حجم ضخم مع ثبات سعري (امتصاص)";
     }
-    else if (anomalyFactor > 2.0 && priceChange24h < -5) {
+    else if (anomalyFactor > 2.0 && shortTermChange < -1.5) {
+        // High Volume + Price Drop = Panic/Forced Selling
         netFlow = 'DISTRIBUTION';
-        alert = "تصريف عنيف: سيولة بيع ضخمة تضغط السعر";
+        alert = "تصريف مؤسساتي (Distribution): بيع كثيف يكسر الدعوم";
     }
-    else if (priceChange24h > 5 && anomalyFactor < 0.8) {
-        netFlow = 'DISTRIBUTION'; // Divergence
-        alert = "صعود وهمي: السعر يرتفع بلا سيولة حقيقية (Trap)";
-    }
-    // New Logic: Volume Spike at Support/Resistance
-    else if (anomalyFactor > 2.0 && isHighClose) {
-        netFlow = 'ACCUMULATION';
-        alert = "شراء مؤسساتي: إغلاق قوي مع حجم تداول عالي";
+    else if (shortTermChange > 3 && anomalyFactor < 0.8) {
+        // Price Up + Low Volume = Fake Pump (Trap)
+        netFlow = 'DISTRIBUTION'; // Technically negative sign
+        alert = "صعود وهمي (Liquidity Trap): السعر يرتفع بلا سيولة حقيقية";
     }
 
     return {
@@ -261,59 +278,115 @@ export const detectWhaleMovements = (
     };
 };
 
+export interface ScoreWeights {
+    momentum: number; // Default 10
+    trend: number;    // Default 10
+    rsiOverbought: number; // Default 20 (Penalty)
+    rsiOversold: number;   // Default 10
+    adx: number;      // Default 5
+    stoch: number;    // Default 10
+    div: number;      // Default 15
+    orderBook: number;// Default 10
+}
+
+const DEFAULT_WEIGHTS: ScoreWeights = {
+    momentum: 10,
+    trend: 10,
+    rsiOverbought: 20,
+    rsiOversold: 10,
+    adx: 5,
+    stoch: 10,
+    div: 15,
+    orderBook: 10
+};
+
 export const calculateTechnicalScore = (
-    prices: number[], // Added prices for Price Action analysis
+    prices: number[],
     rsi: number | null,
     adx: number | null,
     stochRsi: { k: number, d: number, rawK?: number } | null,
     trend: 'UPTREND' | 'DOWNTREND' | 'RANGING',
-    divergence: DivergenceResult
+    divergence: DivergenceResult,
+    orderBook?: OrderBookAnalysis,
+    weights: ScoreWeights = DEFAULT_WEIGHTS // Optional Weights with Default
 ): number => {
     let score = 50; // Base score
 
-    // 0. Price Action Momentum (New Weight: 25%)
-    // Price > EMA9 = Bullish Momentum (Immediate)
+    // 0. Price Action Momentum
     const ema9 = calculateEMA(prices, 9);
     const lastPrice = prices[prices.length - 1];
     const lastEma = ema9[ema9.length - 1];
 
     if (lastEma && !isNaN(lastEma)) {
-        if (lastPrice > lastEma) score += 12; // Bullish Momentum
-        else score -= 12; // Bearish Momentum
+        if (lastPrice > lastEma) score += weights.momentum;
+        else score -= weights.momentum;
     }
 
-    // 1. Trend (Weight: 20% - Reduced from 30%)
-    if (trend === 'UPTREND') score += 10;
-    else if (trend === 'DOWNTREND') score -= 10;
-
-    // 2. RSI (Weight: 20%)
-    if (rsi !== null) {
-        if (rsi < 30) score += 10; // Oversold -> Bullish
-        else if (rsi > 70) score -= 10; // Overbought -> Bearish
-        else if (rsi > 50 && trend === 'UPTREND') score += 5;
-    }
-
-    // 3. ADX (Weight: 15%)
-    if (adx !== null) {
-        if (adx > 25) {
-            // Strong Trend: Amplify current trend score
-            if (trend === 'UPTREND') score += 10;
-            else if (trend === 'DOWNTREND') score -= 10;
+    // 0.5 MA200 Trend Filter (Long Term Trend)
+    // We approximate MA200 if we have enough data (at least 200 points).
+    // If not, we skip this check to avoid hallucination.
+    if (prices.length >= 200) {
+        const ma200Arr = calculateEMA(prices, 200); // Using EMA200 for smoother trend
+        const lastMa200 = ma200Arr[ma200Arr.length - 1];
+        if (lastMa200 && !isNaN(lastMa200)) {
+            if (lastPrice > lastMa200) score += 5; // Bull Market bias
+            else score -= 5; // Bear Market bias
         }
     }
 
-    // 4. StochRSI (Weight: 15%)
-    if (stochRsi !== null) {
-        // Use RAW K if available for faster signal
-        const k = stochRsi.rawK !== undefined ? stochRsi.rawK : stochRsi.k;
+    // 0.6 Volatility Filter (Scalping Safety)
+    // Check standard deviation of last 20 candles vs price
+    const last20 = prices.slice(-20);
+    const avg = last20.reduce((a, b) => a + b, 0) / last20.length;
+    const variance = last20.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / last20.length;
+    const stdDev = Math.sqrt(variance);
+    const volatilityPct = (stdDev / avg) * 100;
 
-        if (k < 20) score += 10; // Oversold -> Bullish (Fast)
-        else if (k > 80) score -= 10; // Overbought -> Bearish (Fast)
+    // Threshold: < 0.1% volatility is "Dead/Flat" -> Penalize heavily for Scalping signals
+    // High volatility > 2% -> Slight penalty for risk, but generally good for scalping
+    if (volatilityPct < 0.1) {
+        score -= 20; // DEAD ZONE - DO NOT TRADE
     }
 
-    // 5. Divergence (Weight: 20%)
-    if (divergence.type === 'BULLISH') score += 15;
-    else if (divergence.type === 'BEARISH') score -= 15;
+    // 1. Trend
+    if (trend === 'UPTREND') score += weights.trend;
+    else if (trend === 'DOWNTREND') score -= weights.trend;
+
+    // 2. RSI
+    if (rsi !== null) {
+        if (rsi < 30) score += weights.rsiOversold; // Oversold -> Bullish
+        else if (rsi > 80) score -= weights.rsiOverbought; // EXTREME OVERBOUGHT -> DANGER
+        else if (rsi > 70) score -= (weights.rsiOverbought / 2); // Overbought -> Bearish
+        else if (rsi > 50 && trend === 'UPTREND') score += (weights.rsiOversold / 2);
+    }
+
+    // 3. ADX
+    if (adx !== null && adx > 25) {
+        if (trend === 'UPTREND') score += weights.adx;
+        else if (trend === 'DOWNTREND') score -= weights.adx;
+    }
+
+    // 4. StochRSI
+    if (stochRsi !== null) {
+        const k = stochRsi.rawK !== undefined ? stochRsi.rawK : stochRsi.k;
+        if (k < 20) score += weights.stoch;
+        else if (k > 80) score -= weights.stoch;
+    }
+
+    // 5. Divergence
+    if (divergence.type === 'BULLISH') score += weights.div;
+    else if (divergence.type === 'BEARISH') score -= weights.div;
+
+    // 6. Order Book & Institutional Pressure
+    if (orderBook) {
+        if (orderBook.marketPressure === 'BUYING') {
+            score += 15; // Updated to +15 per prompt
+            if (orderBook.imbalanceRatio > 2.0) score += 5;
+        } else if (orderBook.marketPressure === 'SELLING') {
+            score -= 15; // Updated to -15 per prompt
+            if (orderBook.imbalanceRatio < 0.5) score -= 5;
+        }
+    }
 
     return Math.max(0, Math.min(100, score));
 };
@@ -360,20 +433,83 @@ export const subscribeToTicker = (onUpdate: (data: any) => void) => {
 };
 
 
+// --- RISK MANAGEMENT ---
+export const checkCorrelationRisk = async (candidateSymbol: string, portfolioSymbols: string[]): Promise<{ maxCorrelation: number; correlatedParams: string | null }> => {
+    if (portfolioSymbols.length === 0) return { maxCorrelation: 0, correlatedParams: null };
+
+    try {
+        // 1. Fetch Candidate History (Daily, 50 candles is enough for correlation)
+        const candidateHistory = await fetchCandlesForAnalysis(candidateSymbol, 'D', 50);
+        if (candidateHistory.length < 30) return { maxCorrelation: 0, correlatedParams: null };
+
+        const candidatePrices = candidateHistory.map(c => c.price);
+
+        let maxCorr = -1;
+        let correlatedPair = null;
+
+        // 2. Compare against each portfolio asset
+        // We limit to 5 assets to prevent API spam
+        const targets = portfolioSymbols.slice(0, 5);
+
+        await Promise.all(targets.map(async (pSymbol) => {
+            if (pSymbol === candidateSymbol) return; // Skip self
+
+            try {
+                const pHistory = await fetchCandlesForAnalysis(pSymbol, 'D', 50);
+                if (pHistory.length < 30) return;
+
+                const pPrices = pHistory.map(c => c.price);
+
+                // Align Arrays (intersection of dates would be best, but simple slice works for approximation)
+                const len = Math.min(candidatePrices.length, pPrices.length);
+                const corr = calculateCorrelation(
+                    candidatePrices.slice(-len),
+                    pPrices.slice(-len)
+                );
+
+                if (corr > maxCorr) {
+                    maxCorr = corr;
+                    correlatedPair = pSymbol;
+                }
+            } catch (e) {
+                console.warn(`Failed correlation check for ${pSymbol}`);
+            }
+        }));
+
+        return { maxCorrelation: maxCorr, correlatedParams: correlatedPair };
+
+    } catch (e) {
+        console.error("Correlation Check Failed", e);
+        return { maxCorrelation: 0, correlatedParams: null };
+    }
+};
+
+
 // --- BINANCE IMPLEMENTATION ---
 
-const getBinanceMarketData = async (limit: number, skipCache: boolean = false): Promise<CoinData[]> => {
+const getBinanceMarketData = async (limit: number, skipCache: boolean = false, category: 'TOP' | 'LOW_CAP' = 'TOP'): Promise<CoinData[]> => {
     try {
         // Enforce strict freshness if skipCache is true
-        const data = await fetchWithCache(`${BINANCE_BASE}/ticker/24hr`, getBinanceHeaders(), skipCache);
+        // NOTE: removed getBinanceHeaders() to avoid CORS on public endpoint
+        const data = await fetchWithCache(`${BINANCE_BASE}/ticker/24hr`, {}, skipCache);
         if (!Array.isArray(data)) throw new Error("Invalid Binance Data Format");
 
         const usdtPairs = data.filter((d: any) => d.symbol.endsWith('USDT'));
 
         // Sort by Volume (Liquidity) - Essential for Scalping
-        const topCoins = usdtPairs.sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume)).slice(0, limit);
+        const sortedCoins = usdtPairs.sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume));
 
-        return topCoins.map((coin: any) => {
+        // Define Slice Range based on Category
+        let candidates: any[] = [];
+        if (category === 'TOP') {
+            candidates = sortedCoins.slice(0, limit);
+        } else {
+            // LOW CAP: Rank 250 to 500
+            // SAFETY FILTER: Min Volume 50k USDT to avoid dead coins
+            candidates = sortedCoins.slice(250, 500).filter((c: any) => parseFloat(c.quoteVolume) > 50000);
+        }
+
+        return candidates.map((coin: any) => {
             const symbol = coin.symbol.replace('USDT', '');
             return {
                 id: coin.symbol,
@@ -397,38 +533,52 @@ const getBinanceMarketData = async (limit: number, skipCache: boolean = false): 
 
 export const fetchCandlesForAnalysis = async (symbol: string, interval: string, limit: number = 100): Promise<ChartPoint[]> => {
     try {
-        const hist = await getBinanceHistory(symbol, interval, false);
+        // Now passing limit correctly
+        const hist = await getBinanceHistory(symbol, interval, false, limit);
         return hist.points || [];
     } catch (e) {
         return [];
     }
 };
 
-const getBinanceHistory = async (symbol: string, timeframe: string, skipCache: boolean = false): Promise<any> => {
+const getBinanceHistory = async (symbol: string, timeframe: string, skipCache: boolean = false, customLimit?: number): Promise<any> => {
     try {
         let interval = '1h';
-        let limit = 200;
+        let limit = customLimit || 200;
 
-        if (timeframe === '1') { interval = '1m'; limit = 200; skipCache = true; } // EXACT 1m data + No Cache
-        else if (timeframe === '5') { interval = '5m'; limit = 200; skipCache = true; } // EXACT 5m data + No Cache
-        else if (timeframe === '15') { interval = '15m'; limit = 200; }
-        else if (timeframe === '30') { interval = '30m'; limit = 200; }
-        else if (timeframe === '60') { interval = '1h'; limit = 200; }
-        else if (timeframe === '240') { interval = '4h'; limit = 200; }
-        else if (timeframe === 'D') { interval = '1d'; limit = 365; }
+        // Valid intervals map to support direct passing of '15m', '1h' etc.
+        const validIntervals = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M'];
+
+        if (validIntervals.includes(timeframe)) {
+            interval = timeframe;
+            // If customLimit not set, default logic:
+            if (!customLimit) {
+                if (timeframe === '1m') limit = 1000;
+                else if (timeframe === '5m') limit = 1000;
+            }
+        } else {
+            // Fallback to legacy numeric mapping if string matches
+            if (timeframe === '1') { interval = '1m'; limit = customLimit || 1000; skipCache = true; }
+            else if (timeframe === '5') { interval = '5m'; limit = customLimit || 1000; skipCache = true; }
+            else if (timeframe === '15') { interval = '15m'; }
+            else if (timeframe === '30') { interval = '30m'; }
+            else if (timeframe === '60') { interval = '1h'; }
+            else if (timeframe === '240') { interval = '4h'; }
+            else if (timeframe === 'D') { interval = '1d'; limit = customLimit || 365; }
+        }
 
         let pair = symbol.toUpperCase().trim();
-        if (pair === 'BITCOIN') pair = 'BTC';
-        if (pair === 'ETHEREUM') pair = 'ETH';
-        if (pair === 'SOLANA') pair = 'SOL';
 
-        if (!pair.includes('USDT') && !pair.endsWith('BTC')) pair = `${pair}USDT`;
+        if (!pair.includes('USDT') && !pair.includes('BTC')) {
+            pair = `${pair}USDT`;
+        } else if (pair.length <= 4 && !pair.includes('USDT')) {
+            pair = `${pair}USDT`;
+        }
 
         const url = `${BINANCE_BASE}/klines?symbol=${pair}&interval=${interval}&limit=${limit}`;
-        // skipCache=true ensures we get the latest candle state for analysis
-        const data = await fetchWithCache(url, getBinanceHeaders(), skipCache);
+        const data = await fetchWithCache(url, {}, skipCache);
 
-        if (!Array.isArray(data) || data.length < 50) return { points: [], volumes: [], highs: [], lows: [] };
+        if (!Array.isArray(data) || data.length < 2) return { points: [], volumes: [], highs: [], lows: [] };
 
         const points: ChartPoint[] = [];
         const highs: number[] = [];
@@ -437,10 +587,18 @@ const getBinanceHistory = async (symbol: string, timeframe: string, skipCache: b
         const prices: number[] = [];
 
         data.forEach((k: any) => {
-            const close = parseFloat(k[4]);
+            if (!k || k.length < 6) return;
+
+            const time = typeof k[0] === 'number' ? k[0] : new Date(k[0]).getTime();
+            if (isNaN(time)) return; // Skip invalid time
+
+            const open = parseFloat(k[1]);
             const high = parseFloat(k[2]);
             const low = parseFloat(k[3]);
+            const close = parseFloat(k[4]);
             const vol = parseFloat(k[5]);
+
+            if (isNaN(close) || isNaN(high) || isNaN(low)) return; // Skip invalid prices
 
             prices.push(close);
             highs.push(high);
@@ -448,9 +606,11 @@ const getBinanceHistory = async (symbol: string, timeframe: string, skipCache: b
             volumes.push(vol);
 
             points.push({
-                time: new Date(k[0]).toISOString(),
+                time: new Date(time).toISOString(),
                 price: close,
-                volume: vol
+                high: high,
+                low: low,
+                volume: isNaN(vol) ? 0 : vol
             });
         });
 
@@ -817,8 +977,8 @@ export const calculateCorrelation = (assetPrices: number[], btcPrices: number[])
 export const calculateVolumeProfile = (prices: number[], volumes: number[], bins: number = 24): VolumeProfile => {
     if (prices.length === 0 || volumes.length === 0) return { poc: 0, vacLow: 0, vacHigh: 0, profile: [] };
 
-    const min = Math.min(...prices);
-    const max = Math.max(...prices);
+    const min = prices.reduce((min, p) => (p < min ? p : min), Infinity);
+    const max = prices.reduce((max, p) => (p > max ? p : max), -Infinity);
     const range = max - min;
     const step = range / bins;
 
@@ -867,7 +1027,9 @@ export const calculateVolumeProfile = (prices: number[], volumes: number[], bins
     let lowIdx = pocIndex;
     let highIdx = pocIndex;
 
+    let loops = 0;
     while (currentVol < targetVol && (lowIdx > 0 || highIdx < bins - 1)) {
+        if (loops++ > bins * 2) break; // Emergency break
         const lowerVol = lowIdx > 0 ? profileBins[lowIdx - 1] : 0;
         const upperVol = highIdx < bins - 1 ? profileBins[highIdx + 1] : 0;
 
@@ -955,4 +1117,140 @@ export const calculateFibonacciLevels = (prices: number[]) => {
         fib618: max - (diff * 0.618),
         fib786: max - (diff * 0.786)
     };
+};
+
+// --- FUTURES DATA (INSTITUTIONAL) ---
+// In-memory cache to prevent spamming proxies (TTL: 60s)
+const futuresCache = new Map<string, { ts: number, data: any }>();
+
+// Cache for Valid Symbols (To prevent 404/500 spam on invalid coins)
+let validFuturesSymbols: Set<string> | null = null;
+let isValidatingSymbols = false;
+
+// Helper to load valid symbols once
+const loadFuturesSymbols = async () => {
+    if (validFuturesSymbols || isValidatingSymbols) return;
+    isValidatingSymbols = true;
+    try {
+        const targetUrl = `${BINANCE_FUTURES_BASE}/exchangeInfo`;
+        const proxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`;
+        const res = await fetch(proxyUrl);
+        if (res.ok) {
+            const data = await res.json();
+            if (data.symbols && Array.isArray(data.symbols)) {
+                validFuturesSymbols = new Set(data.symbols.map((s: any) => s.symbol));
+            }
+        }
+    } catch (e) {
+        // Silent fail
+    } finally {
+        isValidatingSymbols = false;
+    }
+};
+
+export const getBinanceFuturesData = async (coinSymbol: string): Promise<{ openInterest: number, longShortRatio: number, fundingRate: number } | null> => {
+    try {
+        // 1. Sanitize Symbol: Alphanumeric only + USDT suffix
+        const cleanSymbol = coinSymbol.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+        if (!cleanSymbol || cleanSymbol.length < 2) return null; // Reject garbage
+
+        let symbol = cleanSymbol;
+        if (!symbol.endsWith('USDT')) symbol += 'USDT';
+
+        // 2. Strict Validation (Lazy Load to stop 500 errors)
+        if (!validFuturesSymbols) {
+            if (!isValidatingSymbols) loadFuturesSymbols();
+            return null; // STOP: Do not fetch until we have the whitelist. Prevents race conditions/leaks.
+        }
+        if (!validFuturesSymbols.has(symbol)) return null; // SILENT REJECT
+
+        // 3. Check Cache (60s TTL)
+        const now = Date.now();
+        if (futuresCache.has(symbol)) {
+            const cached = futuresCache.get(symbol);
+            if (now - cached.ts < 60000) { // 60 seconds
+                return cached!.data;
+            }
+        }
+
+        // 3. Fetch with Proxy-Only Strategy (NO DIRECT FETCH to avoid CORS errors)
+        const fetchData = async (endpoint: string, baseUrl: string = BINANCE_FUTURES_BASE) => {
+            const targetUrl = `${baseUrl}${endpoint}&symbol=${symbol}`;
+
+            // Defined Proxies (Strictly No Direct Fetch)
+            const proxies = [
+                // CodeTabs
+                `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
+                // AllOrigins (JSON Wrapper) - SAFER: Returns 200 OK even on error, preventing Red Console
+                `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`
+            ];
+
+            for (const proxyUrl of proxies) {
+                try {
+                    const res = await fetch(proxyUrl);
+
+                    // STOP on Client Errors (Likely Symbol Not Found) - Prevent Proxy Spam
+                    if (res.status === 400 || res.status === 404) return null;
+
+                    if (res.ok) {
+                        const text = await res.text();
+
+                        // Handle AllOrigins JSON wrapper
+                        if (proxyUrl.includes('api.allorigins.win/get')) {
+                            try {
+                                const wrapper = JSON.parse(text);
+                                // Check wrapper status for 404/400 as well
+                                if (wrapper.status && (wrapper.status.http_code === 404 || wrapper.status.http_code === 400)) return null;
+
+                                if (wrapper.contents) return JSON.parse(wrapper.contents);
+                            } catch (e) { continue; }
+                        }
+
+                        // Strict JSON check
+                        if (text.trim().startsWith('<')) continue;
+                        return JSON.parse(text);
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+            return null;
+        };
+
+        const [oiRes, lsRes, fundRes] = await Promise.all([
+            fetchData(`/openInterest?`),
+            // FIX: Long/Short Ratio is under /futures/data, not /fapi/v1
+            fetchData(`/globalLongShortAccountRatio?period=5m&limit=1`, 'https://fapi.binance.com/futures/data'),
+            fetchData(`/fundingRate?limit=1`)
+        ]);
+
+        if (!oiRes && !lsRes) return null;
+
+        // Default or Parse
+        const openInterest = oiRes && oiRes.openInterest ? parseFloat(oiRes.openInterest) : 0;
+
+        let longShortRatio = 0;
+        if (Array.isArray(lsRes) && lsRes.length > 0) {
+            longShortRatio = parseFloat(lsRes[0].longShortRatio);
+        }
+
+        let fundingRate = 0;
+        if (Array.isArray(fundRes) && fundRes.length > 0) {
+            fundingRate = parseFloat(fundRes[0].fundingRate);
+        }
+
+        const result = {
+            openInterest,
+            longShortRatio,
+            fundingRate
+        };
+
+        // Update Cache
+        futuresCache.set(symbol, { ts: now, data: result });
+
+        return result;
+
+    } catch (e) {
+        return null;
+    }
 };

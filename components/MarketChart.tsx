@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { createChart, ColorType, ISeriesApi, Time, LineStyle } from 'lightweight-charts';
 import { ChartPoint } from '../types';
+import { formatCurrency, formatNumber } from '../utils/numberUtils';
 
 interface MarketChartProps {
   data: ChartPoint[];
@@ -12,14 +13,14 @@ interface MarketChartProps {
   fibs?: { fib382: number; fib500: number; fib618: number };
 }
 
-export const MarketChart: React.FC<MarketChartProps> = ({ 
-    data, 
-    targetPrice, 
-    stopLoss, 
-    prediction,
-    supports,
-    resistances,
-    fibs
+export const MarketChart: React.FC<MarketChartProps> = ({
+  data,
+  targetPrice,
+  stopLoss,
+  prediction,
+  supports,
+  resistances,
+  fibs
 }) => {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<any>(null);
@@ -63,6 +64,10 @@ export const MarketChart: React.FC<MarketChartProps> = ({
       topColor: 'rgba(41, 98, 255, 0.3)',
       bottomColor: 'rgba(41, 98, 255, 0)',
       lineWidth: 2,
+      priceFormat: {
+        type: 'custom',
+        formatter: (price: number) => formatNumber(price),
+      },
     });
 
     // 3. Add Volume Series (Histogram)
@@ -83,126 +88,132 @@ export const MarketChart: React.FC<MarketChartProps> = ({
 
     // 4. Add Bollinger Bands Series
     const upperBandSeries = chart.addLineSeries({
-        color: 'rgba(43, 230, 255, 0.5)',
-        lineWidth: 1,
-        lineStyle: LineStyle.Solid,
-        lastValueVisible: false,
-        priceLineVisible: false,
-        crosshairMarkerVisible: false,
+      color: 'rgba(43, 230, 255, 0.5)',
+      lineWidth: 1,
+      lineStyle: LineStyle.Solid,
+      lastValueVisible: false,
+      priceLineVisible: false,
+      crosshairMarkerVisible: false,
     });
 
     const lowerBandSeries = chart.addLineSeries({
-        color: 'rgba(43, 230, 255, 0.5)',
-        lineWidth: 1,
-        lineStyle: LineStyle.Solid,
-        lastValueVisible: false,
-        priceLineVisible: false,
-        crosshairMarkerVisible: false,
+      color: 'rgba(43, 230, 255, 0.5)',
+      lineWidth: 1,
+      lineStyle: LineStyle.Solid,
+      lastValueVisible: false,
+      priceLineVisible: false,
+      crosshairMarkerVisible: false,
     });
 
-    // 5. Format Data
-    const formattedData = data.map(d => ({
-      time: (new Date(d.time).getTime() / 1000) as Time,
-      value: d.price
-    }));
+    // 5. Format Data with High Performance & Strict Validation
+    const isValid = (num: any) => typeof num === 'number' && !isNaN(num) && isFinite(num);
 
-    const formattedVolume = data.map((d, i) => {
+    // O(N) Processing using Map for deduplication
+    const dataMap = new Map<number, { time: Time, value: number, vol: number, volColor: string, upper?: number, lower?: number }>();
+
+    data.forEach((d, i) => {
+      if (!isValid(d.price)) return;
+      const timeVal = new Date(d.time).getTime() / 1000;
+
+      // Volume Color Logic
       const prev = data[i - 1]?.price || d.price;
-      const color = d.price >= prev ? 'rgba(34, 197, 94, 0.3)' : 'rgba(239, 68, 68, 0.3)';
-      return {
-        time: (new Date(d.time).getTime() / 1000) as Time,
-        value: d.volume || 0,
-        color: color
-      };
+      const volColor = d.price >= prev ? 'rgba(34, 197, 94, 0.3)' : 'rgba(239, 68, 68, 0.3)';
+
+      dataMap.set(timeVal, {
+        time: timeVal as Time,
+        value: d.price,
+        vol: isValid(d.volume) ? d.volume : 0,
+        volColor: volColor,
+        upper: isValid(d.upperBand) ? d.upperBand : undefined,
+        lower: isValid(d.lowerBand) ? d.lowerBand : undefined
+      });
     });
 
-    const upperBandData = data
-        .filter(d => d.upperBand)
-        .map(d => ({ time: (new Date(d.time).getTime() / 1000) as Time, value: d.upperBand as number }));
-        
-    const lowerBandData = data
-        .filter(d => d.lowerBand)
-        .map(d => ({ time: (new Date(d.time).getTime() / 1000) as Time, value: d.lowerBand as number }));
+    const uniqueData = Array.from(dataMap.values());
 
-    // Remove duplicates
-    const uniqueData = formattedData.filter((v, i, a) => a.findIndex(t => t.time === v.time) === i);
-    const uniqueVolume = formattedVolume.filter((v, i, a) => a.findIndex(t => t.time === v.time) === i);
-    
-    // Set Data
-    areaSeries.setData(uniqueData);
-    volumeSeries.setData(uniqueVolume);
-    upperBandSeries.setData(upperBandData);
-    lowerBandSeries.setData(lowerBandData);
+    // Sort by time just in case (chart requirement)
+    uniqueData.sort((a, b) => (a.time as number) - (b.time as number));
 
-    // 6. Add Target / Stop Loss Lines
-    if (targetPrice) {
-        areaSeries.createPriceLine({
-            price: targetPrice,
-            color: prediction === 'BULLISH' ? '#22c55e' : '#ef4444',
-            lineWidth: 2,
-            lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: 'هدف (TP)',
-        });
+    const areaData = uniqueData.map(d => ({ time: d.time, value: d.value }));
+    const volumeData = uniqueData.map(d => ({ time: d.time, value: d.vol, color: d.volColor }));
+    const upperData = uniqueData.filter(d => d.upper !== undefined).map(d => ({ time: d.time, value: d.upper! }));
+    const lowerData = uniqueData.filter(d => d.lower !== undefined).map(d => ({ time: d.time, value: d.lower! }));
+
+    // Set Data Safely
+    if (areaData.length > 0) areaSeries.setData(areaData);
+    if (volumeData.length > 0) volumeSeries.setData(volumeData);
+    if (upperData.length > 0) upperBandSeries.setData(upperData);
+    if (lowerData.length > 0) lowerBandSeries.setData(lowerData);
+
+    // 6. Add Target / Stop Loss Lines (Safeguarded)
+    if (targetPrice && isValid(targetPrice)) {
+      areaSeries.createPriceLine({
+        price: targetPrice,
+        color: prediction === 'BULLISH' ? '#22c55e' : '#ef4444',
+        lineWidth: 2,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: 'هدف (TP)',
+      });
     }
 
-    if (stopLoss) {
-        areaSeries.createPriceLine({
-            price: stopLoss,
-            color: '#f97316',
-            lineWidth: 2,
-            lineStyle: LineStyle.Dotted,
-            axisLabelVisible: true,
-            title: 'وقف (SL)',
-        });
+    if (stopLoss && isValid(stopLoss)) {
+      areaSeries.createPriceLine({
+        price: stopLoss,
+        color: '#f97316',
+        lineWidth: 2,
+        lineStyle: LineStyle.Dotted,
+        axisLabelVisible: true,
+        title: 'وقف (SL)',
+      });
     }
 
     // 7. Add Auto Support & Resistance Lines (Visualizing Math)
-    if (supports) {
-        supports.forEach(level => {
-            areaSeries.createPriceLine({
-                price: level,
-                color: 'rgba(34, 197, 94, 0.6)', // Green
-                lineWidth: 1,
-                lineStyle: LineStyle.Solid,
-                axisLabelVisible: false,
-                title: 'دعم',
-            });
+    if (supports && supports.length > 0) {
+      supports.filter(isValid).forEach(level => {
+        areaSeries.createPriceLine({
+          price: level,
+          color: 'rgba(34, 197, 94, 0.6)',
+          lineWidth: 1,
+          lineStyle: LineStyle.Solid,
+          axisLabelVisible: false,
+          title: 'دعم',
         });
+      });
     }
 
-    if (resistances) {
-        resistances.forEach(level => {
-            areaSeries.createPriceLine({
-                price: level,
-                color: 'rgba(239, 68, 68, 0.6)', // Red
-                lineWidth: 1,
-                lineStyle: LineStyle.Solid,
-                axisLabelVisible: false,
-                title: 'مقاومة',
-            });
+    if (resistances && resistances.length > 0) {
+      resistances.filter(isValid).forEach(level => {
+        areaSeries.createPriceLine({
+          price: level,
+          color: 'rgba(239, 68, 68, 0.6)',
+          lineWidth: 1,
+          lineStyle: LineStyle.Solid,
+          axisLabelVisible: false,
+          title: 'مقاومة',
         });
+      });
     }
 
     // 8. Add Fibonacci Lines
-    if (fibs) {
-        areaSeries.createPriceLine({
-            price: fibs.fib618,
-            color: 'rgba(250, 204, 21, 0.8)', // Yellow (Golden Pocket)
-            lineWidth: 2,
-            lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: 'Fib 0.618 (Golden)',
-        });
-        
-        areaSeries.createPriceLine({
-            price: fibs.fib500,
-            color: 'rgba(148, 163, 184, 0.5)',
-            lineWidth: 1,
-            lineStyle: LineStyle.Dotted,
-            axisLabelVisible: true,
-            title: 'Fib 0.5',
-        });
+    if (fibs && isValid(fibs.fib618) && isValid(fibs.fib500)) {
+      areaSeries.createPriceLine({
+        price: fibs.fib618,
+        color: 'rgba(250, 204, 21, 0.8)', // Yellow (Golden Pocket)
+        lineWidth: 2,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: 'Fib 0.618 (Golden)',
+      });
+
+      areaSeries.createPriceLine({
+        price: fibs.fib500,
+        color: 'rgba(148, 163, 184, 0.5)',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dotted,
+        axisLabelVisible: true,
+        title: 'Fib 0.5',
+      });
     }
 
     // 9. Fit Content
@@ -218,33 +229,33 @@ export const MarketChart: React.FC<MarketChartProps> = ({
 
   return (
     <div className="w-full bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-2xl relative print:border-slate-300 print:bg-white">
-       {/* Header / Info Overlay */}
-       <div className="absolute top-4 left-4 z-10 flex flex-col gap-2 pointer-events-none">
-          <div className="flex gap-2">
-            <div className="bg-slate-950/80 backdrop-blur px-3 py-1 rounded-lg border border-slate-800 text-xs text-slate-400 print:bg-white print:border-slate-300 print:text-black">
-                TradingView Engine
+      {/* Header / Info Overlay */}
+      <div className="absolute top-4 left-4 z-10 flex flex-col gap-2 pointer-events-none">
+        <div className="flex gap-2">
+          <div className="bg-slate-950/80 backdrop-blur px-3 py-1 rounded-lg border border-slate-800 text-xs text-slate-400 print:bg-white print:border-slate-300 print:text-black">
+            TradingView Engine
+          </div>
+          {data.length > 0 && (
+            <div className="bg-slate-950/80 backdrop-blur px-3 py-1 rounded-lg border border-slate-800 text-xs text-indigo-400 font-mono print:bg-white print:border-slate-300 print:text-indigo-700">
+              {formatCurrency(data[data.length - 1].price)}
             </div>
-            {data.length > 0 && (
-                <div className="bg-slate-950/80 backdrop-blur px-3 py-1 rounded-lg border border-slate-800 text-xs text-indigo-400 font-mono print:bg-white print:border-slate-300 print:text-indigo-700">
-                ${data[data.length-1].price.toLocaleString()}
-                </div>
-            )}
-          </div>
-          <div className="bg-slate-950/80 backdrop-blur px-2 py-1 rounded-lg border border-slate-800 text-[10px] text-cyan-400/70 w-fit print:hidden">
-              Bollinger Bands (20, 2)
-          </div>
-       </div>
+          )}
+        </div>
+        <div className="bg-slate-950/80 backdrop-blur px-2 py-1 rounded-lg border border-slate-800 text-[10px] text-cyan-400/70 w-fit print:hidden">
+          Bollinger Bands (20, 2)
+        </div>
+      </div>
 
-       <div ref={chartContainerRef} className="w-full h-[500px]" />
-       
-       <div className="bg-slate-950 px-4 py-2 border-t border-slate-800 text-[10px] text-slate-500 flex justify-between print:bg-white print:border-slate-300 print:text-black">
-           <span className="flex items-center gap-2">
-               <span className="w-2 h-2 rounded-full bg-green-500/50"></span> دعم
-               <span className="w-2 h-2 rounded-full bg-red-500/50"></span> مقاومة
-               <span className="w-2 h-2 rounded-full bg-yellow-400"></span> تصحيح ذهبي (0.618)
-           </span>
-           <span>Timezone: UTC</span>
-       </div>
+      <div ref={chartContainerRef} className="w-full h-[500px]" />
+
+      <div className="bg-slate-950 px-4 py-2 border-t border-slate-800 text-[10px] text-slate-500 flex justify-between print:bg-white print:border-slate-300 print:text-black">
+        <span className="flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-green-500/50"></span> دعم
+          <span className="w-2 h-2 rounded-full bg-red-500/50"></span> مقاومة
+          <span className="w-2 h-2 rounded-full bg-yellow-400"></span> تصحيح ذهبي (0.618)
+        </span>
+        <span>Timezone: UTC</span>
+      </div>
     </div>
   );
 };

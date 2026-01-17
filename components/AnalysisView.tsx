@@ -6,26 +6,33 @@ import { getCoinHistory, calculateRSI, getCryptoNews, analyzeMarketStructure, ca
 import { runBacktest, BacktestResult, runWalkForwardAnalysis, WalkForwardResult } from '../services/BacktestService';
 
 import { MarketChart } from './MarketChart';
+import { adjustScoreWithLearning } from '../services/LearningService';
+
 import { Brain, ShieldAlert, Target, RefreshCw, AlertTriangle, Waves, Activity, Zap, CheckCircle2, Newspaper, Megaphone, TrendingUp, ArrowDownRight, ArrowUpRight, Scale, Wallet, Save, Calculator, Divide, Printer, FileBarChart, GitCommit, CloudLightning, Loader2, AlertCircle, History, X } from 'lucide-react';
+import { formatNumber } from '../utils/numberUtils';
 
 interface AnalysisViewProps {
-    coin: { id: string, symbol: string };
+    coin: { id: string, symbol: string, mode?: string };
 }
 
 const TIMEFRAMES = [
-    { label: '24س', value: '1', desc: 'مضاربة (Scalping)' },
-    { label: '7أيام', value: '7', desc: 'تداول يومي (Intraday)' },
-    { label: '30يوم', value: '30', desc: 'تداول متأرجح (Swing)' },
-    { label: '90يوم', value: '90', desc: 'استثمار (Trend)' },
+    { label: '15د', value: '15m', desc: 'مضاربة (Scalping)' },
+    { label: '1س', value: '1h', desc: 'لحظي (Hourly)' },
+    { label: '4س', value: '4h', desc: 'جلسة (Session)' },
+    { label: '24س', value: '1d', desc: 'يومي (Day)' },
+    { label: '7أيام', value: '1w', desc: 'أسبوعي (Swing)' },
+    { label: '30يوم', value: '1M', desc: 'شهري (Position)' },
 ];
 
 export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
     const [loading, setLoading] = useState(false);
+    const [backtestOpen, setBacktestOpen] = useState(false);
+    const [correlationRisk, setCorrelationRisk] = useState<{ maxCorrelation: number, symbol: string | null }>({ maxCorrelation: 0, symbol: null });
     const [result, setResult] = useState<AnalysisResult | null>(null);
     const [chartData, setChartData] = useState<ChartPoint[]>([]);
     const [techData, setTechData] = useState<any>(null);
     const [news, setNews] = useState<NewsItem[]>([]);
-    const [selectedTimeframe, setSelectedTimeframe] = useState('7');
+    const [selectedTimeframe, setSelectedTimeframe] = useState('1d');
     const [saved, setSaved] = useState(false);
     const [btcData, setBtcData] = useState<{ correlation: number, trend: string } | null>(null);
     const [providerName, setProviderName] = useState('AI Engine');
@@ -45,6 +52,24 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
         const p = localStorage.getItem('ai_provider');
         setProviderName(p === 'google' ? 'Google Gemini' : 'Alibaba Qwen');
     }, [loading]); // Update when loading starts
+
+    // Auto-Select Timeframe based on Context Mode (Scanner)
+    useEffect(() => {
+        if (!coin.mode) return; // Keep manual selection if no specific mode passed
+
+        let targetTf = '1d';
+        switch (coin.mode) {
+            case 'SCALPING': targetTf = '15m'; break;
+            case 'DAY': targetTf = '4h'; break;
+            case 'SWING': targetTf = '1d'; break;
+            case 'INVESTING': targetTf = '1w'; break;
+            default: targetTf = '1d';
+        }
+
+        setSelectedTimeframe(targetTf);
+        // Only trigger once when mode/coin changes relative to the view mount
+        // We include coin.id so if we switch coins in similar mode it reapplies default
+    }, [coin.mode, coin.id]);
 
     const fetchLatestData = useCallback(async () => {
         try {
@@ -126,17 +151,31 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                     points
                 );
 
+
+
+
+
                 // NEW: Calculate Technical Score Deterministically
-                const technicalScore = calculateTechnicalScore(prices, rsi, adx, stochRsi, structure.trend, divergence);
+                const rawScore = calculateTechnicalScore(prices, rsi, adx, stochRsi, structure.trend, divergence, orderBook);
+
+                // ULTRA-NEW: Apply False Positive Learning
+                // Check if we have repetitive failures matching current context
+                const { adjustedScore, penalties } = adjustScoreWithLearning(rawScore, {
+                    rsi,
+                    volumeSpike,
+                    divergence: divergence.type !== 'NONE'
+                });
 
                 const data = {
                     currentPrice,
                     rsi,
                     divergence,
-                    atr, // Pass ATR
-                    stochRsi, // Pass StochRSI
-                    adx, // Pass ADX
-                    technicalScore, // Pass Pre-calculated Score
+                    atr,
+                    stochRsi,
+                    adx,
+                    technicalScore: adjustedScore, // Use Learned Score
+                    rawScore, // Keep raw for comparison if needed
+                    learningPenalties: penalties, // Pass penalties to UI
                     volProfile,
                     avgVolume,
                     lastVolume,
@@ -146,7 +185,7 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                     fibs,
                     btcCorrelation: correlation,
                     btcTrend: btcTrend,
-                    whaleMetrics, // Pass computed whale metrics
+                    whaleMetrics,
                     macd: {
                         line: lastPoint.macdLine,
                         signal: lastPoint.signalLine,
@@ -156,12 +195,11 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                         upper: lastPoint.upperBand,
                         lower: lastPoint.lowerBand
                     },
-                    // Pass significant history (last 50 points) to AI for Pattern Recognition (Order Blocks, etc)
                     history: points.slice(-50),
                     news: newsData,
                     multiTf,
                     orderBook,
-                    vwap: vwap.slice(-10) // Only pass last 10 points to context to save tokens
+                    vwap: vwap.slice(-10)
                 };
 
                 setTechData(data);
@@ -192,19 +230,27 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
         if (result && portfolioSize > 0 && riskPercentage > 0) {
             const entry = result.price;
             const stop = result.stopLoss;
+            // Risk Management Calc
             const riskAmount = portfolioSize * (riskPercentage / 100);
             const distance = Math.abs(entry - stop);
 
             if (distance > 0) {
                 // Position Size (Units) = Risk / Distance per unit
-                const units = riskAmount / distance;
+                let units = riskAmount / distance;
+
+                // CORRELATION PENALTY
+                if (correlationRisk.maxCorrelation > 0.7) {
+                    const penaltyFactor = 1 - (correlationRisk.maxCorrelation - 0.5); // e.g. 0.9 -> 0.6 multiplier
+                    units = units * penaltyFactor;
+                }
+
                 // Position Size ($) = Units * Entry
                 setPositionSize(units * entry);
             } else {
                 setPositionSize(0);
             }
         }
-    }, [result, portfolioSize, riskPercentage]);
+    }, [result, portfolioSize, riskPercentage, correlationRisk]);
 
     const handleRunAnalysis = async () => {
         setLoading(true);
@@ -215,9 +261,19 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
 
             // 2. Trigger AI Analysis with fresh data
             if (freshData) {
-                const analysis = await analyzeCoinWithGemini(coin.symbol, freshData);
+                // Determine the mode based on selectedTimeframe
+                let mode = 'DAY_TRADING';
+                if (['15m', '1h'].includes(selectedTimeframe)) mode = 'SCALPING';
+                else if (['4h', '1d'].includes(selectedTimeframe)) mode = 'DAY_TRADING';
+                else if (['1w'].includes(selectedTimeframe)) mode = 'SWING_TRADING';
+                else if (['1M'].includes(selectedTimeframe)) mode = 'INVESTMENT';
 
-                // Override Whale Activity with our Calculated Hard Data if AI hallucinates
+                const analysis = await analyzeCoinWithGemini(coin.symbol, {
+                    ...freshData,
+                    mode: mode // Pass active mode
+                });
+
+                // Override Whale Activity
                 if (freshData.whaleMetrics && freshData.whaleMetrics.whaleAlert !== "لا يوجد نشاط غير طبيعي") {
                     analysis.whaleActivity = {
                         netFlow: freshData.whaleMetrics.netFlowStatus,
@@ -237,14 +293,27 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
     const savePrediction = () => {
         if (!result) return;
 
+        // Calculate Expiry based on Timeframe
+        const durationMap: Record<string, number> = {
+            '15m': 2 * 60 * 60 * 1000,   // 2 Hours (8 candles of 15m) - Realistic Scalp window
+            '1h': 6 * 60 * 60 * 1000,    // 6 Hours
+            '4h': 24 * 60 * 60 * 1000,   // 1 Day
+            '1d': 7 * 24 * 60 * 60 * 1000, // 1 Week
+            '1w': 30 * 24 * 60 * 60 * 1000, // 1 Month
+            '1M': 90 * 24 * 60 * 60 * 1000 // 3 Months
+        };
+        const duration = durationMap[selectedTimeframe] || durationMap['1d'];
+
         const newPrediction: SavedPrediction = {
             id: Date.now().toString(),
-            coinSymbol: coin.symbol,
+            coinSymbol: coin.symbol, // coin is {id, symbol}
             entryPrice: result.price,
             targetPrice: result.targetPrice,
             stopLoss: result.stopLoss,
-            predictionType: result.prediction === 'BULLISH' ? 'BULLISH' : 'BEARISH',
+            predictionType: result.prediction,
             date: Date.now(),
+            expiryDate: Date.now() + duration,
+            timeframeLabel: TIMEFRAMES.find(t => t.value === selectedTimeframe)?.label || '24س',
             status: 'PENDING',
             confidence: result.confidenceScore
         };
@@ -330,7 +399,8 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                             </button>
                             {result && (
                                 <>
-                                    {result.prediction !== 'NEUTRAL' && (
+                                    {/* Unhidden for NEUTRAL - Allow saving all analyses */}
+                                    {(
                                         <button
                                             onClick={savePrediction}
                                             disabled={saved}
@@ -422,7 +492,7 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                         <div className="text-left">
                             <div className={`text-lg font-bold font-mono ${btcData.correlation > 0.7 ? 'text-yellow-400 print:text-black' : 'text-slate-200 print:text-black'
                                 }`}>
-                                {btcData.correlation.toFixed(2)}
+                                {formatNumber(btcData.correlation)}
                             </div>
                             <div className="text-xs text-slate-500 print:text-slate-600">
                                 {btcData.trend === 'BULLISH' ? 'Bitcoin صاعد 🔼' : 'Bitcoin هابط 🔽'}
@@ -605,34 +675,76 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                         </div>
                     ) : (
                         <>
-                            <h3 className="text-sm font-bold uppercase tracking-wider text-slate-400 mb-2 print:text-slate-700">الإشارة</h3>
-                            <div className={`text-4xl font-black mb-4 ${result.prediction === 'BULLISH' ? 'text-green-400 print:text-green-700' :
-                                result.prediction === 'BEARISH' ? 'text-red-400 print:text-red-700' : 'text-slate-200 print:text-black'
-                                }`}>
-                                {result.prediction === 'BULLISH' ? 'صعود' : result.prediction === 'BEARISH' ? 'هبوط' : 'محايد'}
-                            </div>
+                            {/* High-Impact News Filter */}
+                            {result.newsAnalysis?.highImpactAlert ? (
+                                <div className="flex flex-col items-center text-center animate-pulse">
+                                    <ShieldAlert className="text-red-500 w-16 h-16 mb-2" />
+                                    <h3 className="text-xl font-black text-red-500 uppercase tracking-widest mb-1">
+                                        تنبيه عالي المخاطر
+                                    </h3>
+                                    <h4 className="text-white font-bold mb-4">High Impact News Detected</h4>
 
-                            {/* Enhanced Confirmation Score Display */}
-                            <div className="w-full flex flex-col items-center">
-                                <div className={`text-3xl font-black mb-1 ${result.confidenceScore >= 90 ? 'text-green-400 drop-shadow-[0_0_8px_rgba(74,222,128,0.5)] print:text-green-700' :
-                                    result.confidenceScore >= 80 ? 'text-yellow-400 drop-shadow-[0_0_8px_rgba(250,204,21,0.5)] print:text-yellow-700' :
-                                        'text-red-400 drop-shadow-[0_0_8px_rgba(248,113,113,0.5)] print:text-red-700'
-                                    }`}>
-                                    {result.confidenceScore}
-                                    <span className="text-lg font-bold text-slate-500 ml-1 opacity-60">/100</span>
-                                </div>
-                                <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 print:text-slate-600">نقاط التأكيد</span>
+                                    <div className="bg-red-950/50 border border-red-500/50 p-3 rounded-lg text-xs text-red-200 mb-4 max-w-[80%]">
+                                        تم إيقاف الإشارة مؤقتاً بسبب حدث
+                                        {result.newsAnalysis.eventCategory ? ` (${result.newsAnalysis.eventCategory}) ` : ' '}
+                                        مفاجئ قد يعكس السوق.
+                                        <br />
+                                        <span className="font-bold block mt-1">السبب: {result.newsAnalysis.summary.slice(0, 50)}...</span>
+                                    </div>
 
-                                <div className="w-full bg-slate-900 rounded-full h-3 overflow-hidden border border-slate-800/50 print:bg-slate-200 print:border-slate-300">
-                                    <div
-                                        className={`h-full transition-all duration-1000 ${result.confidenceScore >= 90 ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]' :
-                                            result.confidenceScore >= 80 ? 'bg-yellow-500 shadow-[0_0_10px_rgba(234,179,8,0.5)]' :
-                                                'bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.5)]'
-                                            }`}
-                                        style={{ width: `${result.confidenceScore}%` }}
-                                    />
+                                    <button
+                                        className="text-[10px] text-slate-500 hover:text-white underline mt-2"
+                                        onClick={() => {
+                                            // Optional: Allow override (Local state hack or just informational)
+                                            alert("تحذير: التداول أثناء الأخبار الكاارثية قد يسبب انزلاقات سعرية ضخمة.");
+                                        }}
+                                    >
+                                        إظهار الإشارة على مسؤوليتي
+                                    </button>
                                 </div>
-                            </div>
+                            ) : (
+                                <>
+                                    <h3 className="text-sm font-bold uppercase tracking-wider text-slate-400 mb-2 print:text-slate-700">الإشارة</h3>
+                                    <div className={`text-4xl font-black mb-4 ${result.prediction === 'BULLISH' ? 'text-green-400 print:text-green-700' :
+                                        result.prediction === 'BEARISH' ? 'text-red-400 print:text-red-700' : 'text-slate-200 print:text-black'
+                                        }`}>
+                                        {result.prediction === 'BULLISH' ? 'صعود' : result.prediction === 'BEARISH' ? 'هبوط' : 'محايد'}
+                                    </div>
+
+                                    {/* Enhanced Confirmation Score Display */}
+                                    <div className="w-full flex flex-col items-center">
+                                        <div className={`text-3xl font-black mb-1 ${result.confidenceScore >= 90 ? 'text-green-400 drop-shadow-[0_0_8px_rgba(74,222,128,0.5)] print:text-green-700' :
+                                            result.confidenceScore >= 80 ? 'text-yellow-400 drop-shadow-[0_0_8px_rgba(250,204,21,0.5)] print:text-yellow-700' :
+                                                'text-red-400 drop-shadow-[0_0_8px_rgba(248,113,113,0.5)] print:text-red-700'
+                                            }`}>
+                                            {result.confidenceScore}
+                                            <span className="text-lg font-bold text-slate-500 ml-1 opacity-60">/100</span>
+                                        </div>
+                                        <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 print:text-slate-600">نقاط التأكيد</span>
+
+                                        {/* Learning Penalties Display */}
+                                        {techData?.learningPenalties && techData.learningPenalties.length > 0 && (
+                                            <div className="mb-2 w-full px-4">
+                                                {techData.learningPenalties.map((penalty: string, idx: number) => (
+                                                    <div key={idx} className="text-[10px] text-red-400 bg-red-950/30 border border-red-900/50 rounded px-2 py-1 mb-1 text-center animate-pulse">
+                                                        📉 {penalty} (Auto-Corrected)
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        <div className="w-full bg-slate-900 rounded-full h-3 overflow-hidden border border-slate-800/50 print:bg-slate-200 print:border-slate-300">
+                                            <div
+                                                className={`h-full transition-all duration-1000 ${result.confidenceScore >= 90 ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]' :
+                                                    result.confidenceScore >= 80 ? 'bg-yellow-500 shadow-[0_0_10px_rgba(234,179,8,0.5)]' :
+                                                        'bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.5)]'
+                                                    }`}
+                                                style={{ width: `${result.confidenceScore}%` }}
+                                            />
+                                        </div>
+                                    </div>
+                                </>
+                            )}
                         </>
                     )}
                 </div>
@@ -660,14 +772,14 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                 {techData && (
                     <div className="grid grid-cols-3 gap-2">
                         <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg text-center print:bg-white print:border-slate-300">
-                            <div className="text-[10px] text-slate-500 uppercase font-bold print:text-black">Trend (ADX)</div>
+                            <div className="text-[10px] text-slate-500 uppercase font-bold print:text-black">قوة الاتجاه (ADX)</div>
                             <div className={`text-lg font-mono font-bold ${(techData.adx || 0) > 25 ? 'text-green-400 print:text-green-700' : 'text-slate-400 print:text-black'
                                 }`}>
-                                {techData.adx !== null ? techData.adx.toFixed(1) : "N/A"}
+                                {techData.adx !== null ? formatNumber(techData.adx) : "N/A"}
                             </div>
                         </div>
                         <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg text-center print:bg-white print:border-slate-300">
-                            <div className="text-[10px] text-slate-500 uppercase font-bold print:text-black">Stoch RSI</div>
+                            <div className="text-[10px] text-slate-500 uppercase font-bold print:text-black">مؤشر Stoch RSI</div>
                             <div className={`text-lg font-mono font-bold ${!techData.stochRsi ? 'text-slate-400' :
                                 techData.stochRsi.k < 20 ? 'text-green-400 print:text-green-700' :
                                     techData.stochRsi.k > 80 ? 'text-red-400 print:text-red-700' : 'text-slate-400 print:text-black'
@@ -676,9 +788,9 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                             </div>
                         </div>
                         <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg text-center print:bg-white print:border-slate-300">
-                            <div className="text-[10px] text-slate-500 uppercase font-bold print:text-black">Volatility</div>
+                            <div className="text-[10px] text-slate-500 uppercase font-bold print:text-black">التقلبات (Volatility)</div>
                             <div className="text-lg font-mono font-bold text-indigo-400 print:text-indigo-700">
-                                {techData.atr !== null ? techData.atr.toFixed(2) : "N/A"}
+                                {techData.atr !== null ? formatNumber(techData.atr) : "N/A"}
                             </div>
                         </div>
                     </div>
@@ -722,6 +834,22 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                                         <span>مبلغ المخاطرة (الخسارة القصوى):</span>
                                         <span className="text-red-400 font-bold">${(portfolioSize * (riskPercentage / 100)).toFixed(2)}</span>
                                     </div>
+
+                                    {/* CORRELATION WARNING */}
+                                    {correlationRisk.maxCorrelation > 0.7 && (
+                                        <div className="mt-2 pt-2 border-t border-slate-800/50">
+                                            <div className="flex items-start gap-2 text-[10px] text-orange-400">
+                                                <AlertTriangle size={12} className="shrink-0 mt-0.5" />
+                                                <div>
+                                                    <span className="font-bold block">تحذير ارتباط (Correlation Risk)</span>
+                                                    <span>
+                                                        العملة مرتبطة بنسبة {(correlationRisk.maxCorrelation * 100).toFixed(0)}% مع صفقة مفتوحة ({correlationRisk.symbol}).
+                                                        تم تقليل حجم العقد لتقليل المخاطر.
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         </div>
@@ -896,7 +1024,7 @@ export const AnalysisView: React.FC<AnalysisViewProps> = ({ coin }) => {
                     </div>
                 )}
             </div>
-        </div>
+        </div >
 
     );
 };
